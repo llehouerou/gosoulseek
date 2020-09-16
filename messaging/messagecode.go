@@ -1,6 +1,6 @@
 package messaging
 
-type MessageCode int
+type MessageCode uint32
 
 const (
 	Unknown                     MessageCode = 0
@@ -46,7 +46,7 @@ const (
 	AddPrivilegedUser           MessageCode = 91
 	CheckPrivileges             MessageCode = 92
 	SearchRequest               MessageCode = 93
-	AcceptChildren                          = 100
+	AcceptChildren              MessageCode = 100
 	NetInfo                     MessageCode = 102
 	WishlistSearch              MessageCode = 103
 	WishlistInterval            MessageCode = 104
