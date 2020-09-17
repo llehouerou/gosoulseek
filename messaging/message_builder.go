@@ -49,12 +49,12 @@ func (b *MessageBuilder) String(value string) *MessageBuilder {
 
 func toByteArray32(i uint32) []byte {
 	res := make([]byte, 4)
-	binary.BigEndian.PutUint32(res, i)
+	binary.LittleEndian.PutUint32(res, i)
 	return res
 }
 
 func toByteArray64(i uint64) []byte {
 	res := make([]byte, 8)
-	binary.BigEndian.PutUint64(res, i)
+	binary.LittleEndian.PutUint64(res, i)
 	return res
 }
