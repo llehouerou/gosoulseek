@@ -29,6 +29,15 @@ func (r *MessageReader) ReadByte() (byte, error) {
 	return r.reader.ReadByte()
 }
 
+func (r *MessageReader) ReadBytes(length int) ([]byte, error) {
+	chunk := make([]byte, length)
+	_, err := io.ReadFull(r.reader, chunk)
+	if err != nil {
+		return nil, fmt.Errorf("reading %d bytes: %v", length, err)
+	}
+	return chunk, nil
+}
+
 func (r *MessageReader) ReadInteger() (int, error) {
 	chunk := make([]byte, 4)
 	_, err := io.ReadFull(r.reader, chunk)
