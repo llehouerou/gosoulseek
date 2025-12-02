@@ -1,4 +1,4 @@
-.PHONY: tools fmt lint test coverage check build install-hooks
+.PHONY: tools fmt lint test coverage check build install-hooks run-poc
 
 # Install/update tools
 tools:
@@ -41,3 +41,7 @@ build:
 install-hooks:
 	cp scripts/pre-commit .git/hooks/pre-commit
 	chmod +x .git/hooks/pre-commit
+
+# Run POC (requires .env file with credentials)
+run-poc:
+	go run ./cmd/poc

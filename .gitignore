@@ -19,3 +19,6 @@ Soulseek.NET/
 
 # MCP config
 .mcp.json
+
+# Environment files (use .env.example as template)
+.env
