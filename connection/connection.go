@@ -105,3 +105,19 @@ func (c *Conn) LocalAddr() net.Addr {
 func (c *Conn) RemoteAddr() net.Addr {
 	return c.conn.RemoteAddr()
 }
+
+// Write writes raw bytes to the connection (bypassing message framing).
+// Used for transfer connections that send raw file offsets.
+func (c *Conn) Write(p []byte) (int, error) {
+	n, err := c.w.Write(p)
+	if err != nil {
+		return n, err
+	}
+	return n, c.w.Flush()
+}
+
+// Read reads raw bytes from the connection (bypassing message framing).
+// Used for transfer connections that receive raw file data.
+func (c *Conn) Read(p []byte) (int, error) {
+	return c.r.Read(p)
+}

@@ -11,6 +11,7 @@ Port the Soulseek.NET library to idiomatic Go, providing a complete Soulseek pro
 3. **Readable** - Clear naming, small functions, minimal nesting
 4. **Extensible** - Easy to add new message types without modifying core code
 5. **Maintainable** - Separation of concerns, no god objects
+6. **Channels over Callbacks** - Use channels for async results, context for cancellation
 
 ## Implementation Phases
 
@@ -32,89 +33,93 @@ Port the Soulseek.NET library to idiomatic Go, providing a complete Soulseek pro
 
 ---
 
-### Phase 2: Server Connection Management
+### Phase 2: Server Connection Management ✅ COMPLETE
 
-**Goal**: Establish a robust server connection with automatic reconnection.
-
-| Component | Status | Description |
-|-----------|--------|-------------|
-| `client/client.go` | ⬚ | Main SoulseekClient struct |
-| `client/options.go` | ⬚ | Client configuration options |
-| Server message handler | ⬚ | Route incoming server messages |
-| SetListenPort message | ⬚ | Required after login |
-| SetOnlineStatus message | ⬚ | Set online/away status |
-| Automatic ping/keepalive | ⬚ | Maintain connection |
-
-**Key messages to implement**:
-- `SetListenPort` (code 2)
-- `SetOnlineStatus` (code 28)
-- `SharedFoldersAndFiles` (code 35)
-
----
-
-### Phase 3: Room and Chat
-
-**Goal**: Join rooms, send/receive chat messages.
+**Goal**: Establish a robust server connection with client API.
 
 | Component | Status | Description |
 |-----------|--------|-------------|
-| Room list request/response | ⬚ | Get available rooms |
-| Join/Leave room | ⬚ | Room membership |
-| Room messages | ⬚ | Send/receive chat |
-| Private messages | ⬚ | Direct user messages |
-| User status tracking | ⬚ | Watch users online/offline |
+| `client/client.go` | ✅ | Main Client struct |
+| `client/options.go` | ✅ | Client configuration options |
+| `messages/server/setlistenport.go` | ✅ | SetListenPort message |
+| `messages/server/setonlinestatus.go` | ✅ | SetOnlineStatus message |
+| `messages/server/sharedfoldersandfiles.go` | ✅ | SharedFoldersAndFiles message |
 
-**Key messages to implement**:
-- `RoomList` (code 64)
-- `JoinRoom` (code 14)
-- `LeaveRoom` (code 15)
-- `SayInChatRoom` (code 13)
-- `PrivateMessage` (code 22)
-- `WatchUser` (code 5)
-- `GetStatus` (code 7)
+**Result**: Client with Connect/Login/Disconnect, automatic post-login configuration.
 
 ---
 
-### Phase 4: Search
+### Phase 3: Search ✅ COMPLETE
 
-**Goal**: Perform searches and receive results.
+**Goal**: Perform searches and receive results via channels.
 
 | Component | Status | Description |
 |-----------|--------|-------------|
-| Search request | ⬚ | Send file search query |
-| Search response handler | ⬚ | Process search results |
-| Search result aggregation | ⬚ | Collect results from peers |
-| Wishlist search | ⬚ | Scheduled searches |
+| `protocol/compress.go` | ✅ | zlib compression/decompression |
+| `messages/peer/file.go` | ✅ | File and FileAttribute types |
+| `messages/peer/searchresponse.go` | ✅ | SearchResponse parsing |
+| `messages/peer/init.go` | ✅ | Peer initialization message |
+| `messages/server/filesearch.go` | ✅ | FileSearch request |
+| `messages/server/connecttopeer.go` | ✅ | ConnectToPeer response |
+| `client/router.go` | ✅ | Message dispatching |
+| `client/search.go` | ✅ | Search with channel-based results |
+| `client/peer.go` | ✅ | Peer connection handling |
 
-**Key messages to implement**:
-- `FileSearch` (code 26)
-- `UserSearch` (code 42)
-- `RoomSearch` (code 120)
-- `WishlistSearch` (code 103)
+**API**:
+```go
+ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+defer cancel()
+
+results, err := client.Search(ctx, "artist album")
+for resp := range results {
+    fmt.Printf("%s: %d files\n", resp.Username, len(resp.Files))
+}
+```
+
+**Result**: Full search working with channel-based results, automatic peer connections.
 
 ---
 
-### Phase 5: Peer Connections
+### Phase 4: File Downloads ✅ COMPLETE
 
-**Goal**: Establish direct connections with other users.
+**Goal**: Download files from peers.
 
 | Component | Status | Description |
 |-----------|--------|-------------|
-| Peer connection manager | ⬚ | Pool of peer connections |
-| PeerInit message | ⬚ | Connection handshake |
-| PierceFirewall | ⬚ | NAT traversal |
-| ConnectToPeer handling | ⬚ | Server-mediated connections |
-| Waiter pattern | ⬚ | Async request-response matching |
+| `messages/peer/transfer.go` | ✅ | Transfer request/response messages |
+| `messages/server/getpeeraddress.go` | ✅ | GetPeerAddress request/response |
+| `client/download.go` | ✅ | Download manager with progress tracking |
+| `client/router.go` | ✅ | Updated with handler unregistration |
 
-**Key messages to implement**:
-- `ConnectToPeer` (code 18)
-- `PeerInit` (init code 1)
-- `PierceFirewall` (init code 0)
-- Peer message codes (4-byte)
+**Peer messages implemented**:
+- `TransferRequest` (peer code 40)
+- `TransferResponse` (peer code 41)
+- `QueueDownload` (peer code 43)
+- `PlaceInQueueRequest` (peer code 51)
+- `PlaceInQueueResponse` (peer code 44)
+- `UploadFailed` (peer code 46)
+- `UploadDenied` (peer code 50)
+
+**API**:
+```go
+ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+defer cancel()
+
+file, _ := os.Create("output.mp3")
+progress, err := client.Download(ctx, "username", "@@music/file.mp3", file)
+for p := range progress {
+    fmt.Printf("%.1f%% complete\n", p.PercentComplete())
+    if p.Error != nil {
+        return p.Error
+    }
+}
+```
+
+**Result**: Channel-based download progress, automatic peer connection, queue handling.
 
 ---
 
-### Phase 6: Browse and User Info
+### Phase 5: Browse and User Info
 
 **Goal**: Browse user shares and get user information.
 
@@ -123,43 +128,30 @@ Port the Soulseek.NET library to idiomatic Go, providing a complete Soulseek pro
 | Browse request | ⬚ | Request user's file list |
 | Browse response parser | ⬚ | Parse compressed file list |
 | User info request | ⬚ | Get user description/picture |
-| Folder contents | ⬚ | Get specific folder contents |
 
 **Key messages to implement**:
 - `BrowseRequest` (peer code 4)
 - `BrowseResponse` (peer code 5)
 - `InfoRequest` (peer code 15)
 - `InfoResponse` (peer code 16)
-- `FolderContentsRequest` (peer code 36)
-- `FolderContentsResponse` (peer code 37)
 
 ---
 
-### Phase 7: File Transfers
+### Phase 6: Upload Support
 
-**Goal**: Download and upload files.
+**Goal**: Allow others to download from us.
 
 | Component | Status | Description |
 |-----------|--------|-------------|
-| Transfer manager | ⬚ | Queue and track transfers |
-| Download initiation | ⬚ | Request file downloads |
-| Upload handling | ⬚ | Serve upload requests |
-| Transfer progress | ⬚ | Track bytes transferred |
-| Queue management | ⬚ | Place in queue handling |
-| Rate limiting | ⬚ | Token bucket for bandwidth |
-
-**Key messages to implement**:
-- `TransferRequest` (peer code 40)
-- `TransferResponse` (peer code 41)
-- `QueueDownload` (peer code 43)
-- `PlaceInQueueRequest` (peer code 51)
-- `PlaceInQueueResponse` (peer code 44)
-- `UploadDenied` (peer code 50)
-- `UploadFailed` (peer code 46)
+| Share scanner | ⬚ | Scan local directories |
+| Share index | ⬚ | Searchable file index |
+| Search responder | ⬚ | Answer incoming searches |
+| Upload handler | ⬚ | Serve file requests |
+| Queue management | ⬚ | Manage upload queue |
 
 ---
 
-### Phase 8: Distributed Network
+### Phase 7: Distributed Network (Optional)
 
 **Goal**: Participate in the distributed search network.
 
@@ -169,37 +161,18 @@ Port the Soulseek.NET library to idiomatic Go, providing a complete Soulseek pro
 | Search request forwarding | ⬚ | Route searches |
 | Branch level management | ⬚ | Track network position |
 
-**Key messages to implement**:
-- `DistributedSearchRequest` (dist code 3)
-- `DistributedPing` (dist code 0)
-- `DistributedBranchLevel` (dist code 4)
-- `DistributedBranchRoot` (dist code 5)
-- `EmbeddedMessage` (code 93)
-
 ---
 
-### Phase 9: Share Management
+### Phase 8: Room and Chat (Low Priority)
 
-**Goal**: Manage local shared files.
+**Goal**: Join rooms, send/receive chat messages.
 
 | Component | Status | Description |
 |-----------|--------|-------------|
-| Share scanner | ⬚ | Scan local directories |
-| Share database | ⬚ | Index shared files |
-| Search responder | ⬚ | Answer incoming searches |
-| Share count reporting | ⬚ | Report to server |
-
----
-
-### Phase 10: Polish and Production Ready
-
-| Component | Status | Description |
-|-----------|--------|-------------|
-| Comprehensive error handling | ⬚ | All error cases covered |
-| Logging/diagnostics | ⬚ | Structured logging |
-| Metrics/observability | ⬚ | Prometheus metrics |
-| Documentation | ⬚ | GoDoc, examples |
-| Integration tests | ⬚ | End-to-end tests |
+| Room list | ⬚ | Get available rooms |
+| Join/Leave room | ⬚ | Room membership |
+| Room messages | ⬚ | Send/receive chat |
+| Private messages | ⬚ | Direct user messages |
 
 ---
 
@@ -208,13 +181,16 @@ Port the Soulseek.NET library to idiomatic Go, providing a complete Soulseek pro
 | Pattern | Where | Why |
 |---------|-------|-----|
 | `io.Reader`/`io.Writer` wrapping | protocol package | Composable, works with any stream |
+| `io.Writer` for download dest | client.Download | Flexible output (file, buffer, etc.) |
 | Sticky errors | Reader/Writer | Cleaner API, check once at end |
-| `context.Context` for cancellation | connection.Dial | Standard Go timeout/cancellation |
+| `context.Context` for cancellation | all blocking ops | Standard Go timeout/cancellation |
+| Channels for async results | Search, Download | Idiomatic Go concurrency |
 | `net.Pipe()` for testing | connection tests | In-memory testing without network |
 | Error wrapping with `%w` | everywhere | Proper error chain for debugging |
 | `run() error` pattern | main.go | Testable main, proper exit codes |
 | Interface-based DI | NewConn(net.Conn) | Inject mocks for testing |
 | Table-driven tests | *_test.go | Comprehensive test coverage |
+| State machines | download progress | Clear state transitions |
 
 ---
 
