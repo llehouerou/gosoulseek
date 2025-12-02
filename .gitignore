@@ -1,0 +1,21 @@
+# Binaries
+gosoulseek
+*.exe
+
+# IDE
+.idea/
+.vscode/
+.claude/
+*.swp
+
+# OS
+.DS_Store
+
+# Test coverage
+coverage.out
+
+# Reference project (cloned for porting)
+Soulseek.NET/
+
+# MCP config
+.mcp.json
