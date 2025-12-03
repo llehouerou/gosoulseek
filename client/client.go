@@ -24,7 +24,9 @@ type Client struct {
 	router        *MessageRouter
 	searches      *searchRegistry
 	downloads     *downloadRegistry
+	transfers     *TransferRegistry // Unified transfer tracking
 	listener      *Listener
+	peerConnMgr   *peerConnManager      // Manages P-type connections to peers
 	solicitations *pendingSolicitations // Pending connections WE solicited
 	peerSolicits  *pendingPeerSolicits  // Pending connections PEER solicited (from ConnectToPeer)
 	mu            sync.Mutex
@@ -57,9 +59,11 @@ func New(opts *Options) *Client {
 		router:        NewMessageRouter(),
 		searches:      newSearchRegistry(),
 		downloads:     newDownloadRegistry(),
+		transfers:     NewTransferRegistry(),
 		solicitations: newPendingSolicitations(),
 		peerSolicits:  newPendingPeerSolicits(),
 	}
+	c.peerConnMgr = newPeerConnManager(c)
 	c.listener = newListener(c)
 	return c
 }
@@ -67,6 +71,11 @@ func New(opts *Options) *Client {
 // Router returns the message router for registering custom handlers.
 func (c *Client) Router() *MessageRouter {
 	return c.router
+}
+
+// Transfers returns the transfer registry for tracking downloads and uploads.
+func (c *Client) Transfers() *TransferRegistry {
+	return c.transfers
 }
 
 // Disconnected returns a channel that is closed when the client disconnects.
@@ -177,6 +186,7 @@ func (c *Client) Login(ctx context.Context, username, password string) error {
 	c.ipAddress = resp.IPAddress
 	c.isSupporter = resp.IsSupporter
 	c.loggedIn = true
+	c.peerConnMgr.ourUsername = username
 
 	// Send post-login configuration
 	if err := c.sendPostLoginConfig(); err != nil {
@@ -342,6 +352,9 @@ func (c *Client) Disconnect() error {
 	// Close all active channels
 	c.searches.closeAll()
 	c.downloads.closeAll()
+
+	// Close peer connection manager
+	c.peerConnMgr.Close()
 
 	// Wait for read loop to finish (outside lock to avoid deadlock)
 	if c.doneCh != nil {
@@ -607,7 +620,7 @@ func (c *Client) handlePeerTransferRequestWithConn(payload []byte, username stri
 	}
 
 	// Update progress
-	dl.sendProgress(TransferStateConnecting, req.FileSize, 0, 0, nil)
+	dl.sendProgress(TransferStateInitializing, req.FileSize, 0, 0, nil)
 }
 
 // handlePlaceInQueueResponse handles queue position updates.
@@ -619,7 +632,7 @@ func (c *Client) handlePlaceInQueueResponse(payload []byte, username string) {
 
 	dl := c.downloads.getByFile(username, resp.Filename)
 	if dl != nil {
-		dl.sendProgress(TransferStateQueuedRemotely, dl.fileSize, 0, resp.Place, nil)
+		dl.sendProgress(TransferStateQueued|TransferStateRemotely, dl.fileSize, 0, resp.Place, nil)
 	}
 }
 
@@ -632,7 +645,7 @@ func (c *Client) handleUploadDenied(payload []byte, username string) {
 
 	dl := c.downloads.getByFile(username, denied.Filename)
 	if dl != nil {
-		dl.sendProgress(TransferStateFailed, dl.fileSize, 0, 0, fmt.Errorf("upload denied: %s", denied.Reason))
+		dl.sendProgress(TransferStateCompleted|TransferStateErrored, dl.fileSize, 0, 0, fmt.Errorf("upload denied: %s", denied.Reason))
 	}
 }
 
@@ -645,6 +658,6 @@ func (c *Client) handleUploadFailed(payload []byte, username string) {
 
 	dl := c.downloads.getByFile(username, failed.Filename)
 	if dl != nil {
-		dl.sendProgress(TransferStateFailed, dl.fileSize, 0, 0, errors.New("upload failed"))
+		dl.sendProgress(TransferStateCompleted|TransferStateErrored, dl.fileSize, 0, 0, errors.New("upload failed"))
 	}
 }

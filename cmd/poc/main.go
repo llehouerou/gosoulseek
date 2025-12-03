@@ -170,28 +170,36 @@ func downloadFile(ctx context.Context, c *client.Client, username string, file *
 
 	// Monitor progress
 	for p := range progress {
-		switch p.State {
-		case client.TransferStateQueued:
-			fmt.Println("  Status: queued locally")
-		case client.TransferStateRequested:
-			fmt.Println("  Status: request sent")
-		case client.TransferStateQueuedRemotely:
+		// Check for completed states first
+		if p.State.IsCompleted() {
+			switch {
+			case p.State&client.TransferStateSucceeded != 0:
+				fmt.Printf("\n  Download completed! Saved to: %s\n", outputPath)
+			case p.State&client.TransferStateCancelled != 0:
+				return errors.New("transfer cancelled")
+			default:
+				return fmt.Errorf("transfer failed: %w", p.Error)
+			}
+			continue
+		}
+
+		// Check active states
+		switch {
+		case p.State&client.TransferStateInProgress != 0:
+			pct := p.PercentComplete()
+			fmt.Printf("  Progress: %.1f%% (%d / %d bytes)\r", pct, p.BytesTransferred, p.FileSize)
+		case p.State&client.TransferStateInitializing != 0:
+			fmt.Println("  Status: connecting for transfer")
+		case p.State.IsQueued() && p.State.IsRemote():
 			if p.QueuePosition > 0 {
 				fmt.Printf("  Status: queued remotely (position %d)\n", p.QueuePosition)
 			} else {
 				fmt.Println("  Status: queued remotely")
 			}
-		case client.TransferStateConnecting:
-			fmt.Println("  Status: connecting for transfer")
-		case client.TransferStateTransferring:
-			pct := p.PercentComplete()
-			fmt.Printf("  Progress: %.1f%% (%d / %d bytes)\r", pct, p.BytesTransferred, p.FileSize)
-		case client.TransferStateCompleted:
-			fmt.Printf("\n  Download completed! Saved to: %s\n", outputPath)
-		case client.TransferStateFailed:
-			return fmt.Errorf("transfer failed: %w", p.Error)
-		case client.TransferStateCancelled:
-			return errors.New("transfer cancelled")
+		case p.State.IsQueued() && p.State.IsLocal():
+			fmt.Println("  Status: queued locally")
+		case p.State&client.TransferStateRequested != 0:
+			fmt.Println("  Status: request sent")
 		}
 	}
 

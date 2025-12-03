@@ -29,17 +29,12 @@ type Listener struct {
 	mu       sync.RWMutex
 	ctx      context.Context
 	cancel   context.CancelFunc
-
-	// P-type connection cache (one per username)
-	peerConns   map[string]*connection.Conn
-	peerConnsMu sync.RWMutex
 }
 
 // newListener creates a new listener for the client.
 func newListener(client *Client) *Listener {
 	return &Listener{
-		client:    client,
-		peerConns: make(map[string]*connection.Conn),
+		client: client,
 	}
 }
 
@@ -93,13 +88,7 @@ func (l *Listener) Stop() error {
 
 	l.mu.Unlock()
 
-	// Close all cached peer connections
-	l.peerConnsMu.Lock()
-	for username, conn := range l.peerConns {
-		conn.Close()
-		delete(l.peerConns, username)
-	}
-	l.peerConnsMu.Unlock()
+	// Peer connections are managed by peerConnMgr and closed by Client.Disconnect()
 
 	return err
 }
@@ -197,11 +186,9 @@ func (l *Listener) handlePierceFirewall(conn *connection.Conn, token uint32) {
 	if ok {
 		switch solicit.connType {
 		case server.ConnectionTypePeer:
-			// P-type: cache and handle messages
-			cached := l.getOrCachePeerConn(solicit.username, conn)
-			if cached == conn {
-				go l.client.handleIncomingPeerMessages(conn, solicit.username)
-			}
+			// P-type: cache via manager (supersedes any existing connection)
+			l.client.peerConnMgr.Add(solicit.username, conn)
+			go l.client.handleIncomingPeerMessages(conn, solicit.username)
 		case server.ConnectionTypeTransfer:
 			// F-type: hand off to download flow
 			l.handleTransferConnection(conn, solicit.username)
@@ -226,11 +213,9 @@ func (l *Listener) handlePierceFirewall(conn *connection.Conn, token uint32) {
 func (l *Listener) handlePeerInit(conn *connection.Conn, init *peer.Init) {
 	switch init.Type {
 	case "P":
-		// P-type: cache and handle messages
-		cached := l.getOrCachePeerConn(init.Username, conn)
-		if cached == conn {
-			go l.client.handleIncomingPeerMessages(conn, init.Username)
-		}
+		// P-type: cache via manager (supersedes any existing connection)
+		l.client.peerConnMgr.Add(init.Username, conn)
+		go l.client.handleIncomingPeerMessages(conn, init.Username)
 	case "F":
 		// F-type: hand off to download flow
 		l.handleTransferConnection(conn, init.Username)
@@ -278,28 +263,4 @@ func (l *Listener) handleTransferConnection(conn *connection.Conn, username stri
 		// Channel full or closed
 		conn.Close()
 	}
-}
-
-// getOrCachePeerConn caches a P-type connection for the given username.
-// If a connection already exists, the new one is closed and the existing one is returned.
-func (l *Listener) getOrCachePeerConn(username string, conn *connection.Conn) *connection.Conn {
-	l.peerConnsMu.Lock()
-	defer l.peerConnsMu.Unlock()
-
-	if existing, ok := l.peerConns[username]; ok {
-		// Already have a connection - close the new one
-		conn.Close()
-		return existing
-	}
-
-	l.peerConns[username] = conn
-	return conn
-}
-
-// invalidatePeerConn removes a cached peer connection.
-// Called when a connection is closed or fails.
-func (l *Listener) invalidatePeerConn(username string) {
-	l.peerConnsMu.Lock()
-	delete(l.peerConns, username)
-	l.peerConnsMu.Unlock()
 }

@@ -249,6 +249,7 @@ func TestPeerInitPTypeRouting(t *testing.T) {
 		solicitations: newPendingSolicitations(),
 		downloads:     newDownloadRegistry(),
 	}
+	client.peerConnMgr = newPeerConnManager(client)
 	listener := newListener(client)
 
 	err := listener.Start(0)
@@ -271,10 +272,8 @@ func TestPeerInitPTypeRouting(t *testing.T) {
 	// Give the listener time to process
 	time.Sleep(50 * time.Millisecond)
 
-	// Verify the connection is cached
-	listener.peerConnsMu.RLock()
-	cached, ok := listener.peerConns["testpeer"]
-	listener.peerConnsMu.RUnlock()
+	// Verify the connection is cached via the manager
+	cached, ok := client.peerConnMgr.GetCached("testpeer")
 
 	assert.True(t, ok)
 	assert.NotNil(t, cached)
@@ -440,6 +439,7 @@ func TestPeerSolicitRouting(t *testing.T) {
 		solicitations: newPendingSolicitations(),
 		downloads:     newDownloadRegistry(),
 	}
+	client.peerConnMgr = newPeerConnManager(client)
 	listener := newListener(client)
 
 	err := listener.Start(0)
@@ -468,10 +468,8 @@ func TestPeerSolicitRouting(t *testing.T) {
 	// Give the listener time to process
 	time.Sleep(50 * time.Millisecond)
 
-	// Verify the connection is cached under the username
-	listener.peerConnsMu.RLock()
-	cached, ok := listener.peerConns[username]
-	listener.peerConnsMu.RUnlock()
+	// Verify the connection is cached via the manager
+	cached, ok := client.peerConnMgr.GetCached(username)
 
 	assert.True(t, ok)
 	assert.NotNil(t, cached)
@@ -511,16 +509,17 @@ func TestDTypeRejection(t *testing.T) {
 	assert.Error(t, err)
 }
 
-// TestPeerConnCaching tests that P-type connections are cached correctly.
+// TestPeerConnCaching tests that P-type connections are cached correctly via the manager.
+// Detailed caching tests are in connmanager_test.go; this tests integration.
 func TestPeerConnCaching(t *testing.T) {
 	client := &Client{
 		peerSolicits:  newPendingPeerSolicits(),
 		solicitations: newPendingSolicitations(),
 		downloads:     newDownloadRegistry(),
 	}
-	listener := newListener(client)
+	client.peerConnMgr = newPeerConnManager(client)
 
-	// Test caching behavior directly
+	// Test caching behavior through the manager
 	server1, client1 := net.Pipe()
 	defer server1.Close()
 	conn1 := connection.NewConn(client1)
@@ -529,23 +528,28 @@ func TestPeerConnCaching(t *testing.T) {
 	defer server2.Close()
 	conn2 := connection.NewConn(client2)
 
-	// Cache first connection
-	cached := listener.getOrCachePeerConn("testuser", conn1)
+	// Add first connection
+	superseded := client.peerConnMgr.Add("testuser", conn1)
+	assert.Nil(t, superseded)
+
+	// Verify it's cached
+	cached, ok := client.peerConnMgr.GetCached("testuser")
+	assert.True(t, ok)
 	assert.Equal(t, conn1, cached)
 
-	// Second connection should return first, not cache
-	cached = listener.getOrCachePeerConn("testuser", conn2)
-	assert.Equal(t, conn1, cached)
-	assert.NotEqual(t, conn2, cached)
+	// Add second connection - should supersede first
+	superseded = client.peerConnMgr.Add("testuser", conn2)
+	assert.Equal(t, conn1, superseded)
+
+	// Verify new connection is cached
+	cached, ok = client.peerConnMgr.GetCached("testuser")
+	assert.True(t, ok)
+	assert.Equal(t, conn2, cached)
 
 	// Invalidate
-	listener.invalidatePeerConn("testuser")
+	client.peerConnMgr.Invalidate("testuser")
 
-	// Now new connection should be cached
-	server3, client3 := net.Pipe()
-	defer server3.Close()
-	conn3 := connection.NewConn(client3)
-
-	cached = listener.getOrCachePeerConn("testuser", conn3)
-	assert.Equal(t, conn3, cached)
+	// Now should not be cached
+	_, ok = client.peerConnMgr.GetCached("testuser")
+	assert.False(t, ok)
 }

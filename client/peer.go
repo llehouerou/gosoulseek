@@ -114,65 +114,24 @@ func (c *Client) connectToPeerForTransfer(msg *server.ConnectToPeer) {
 	}
 }
 
-// connectToPeer establishes a connection to a peer and receives messages.
+// connectToPeer establishes a connection to a peer for receiving messages.
+// Uses the connection manager for caching and reuse.
 func (c *Client) connectToPeer(msg *server.ConnectToPeer) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	addr := fmt.Sprintf("%s:%d", msg.IPAddress, msg.Port)
 
-	conn, err := connection.Dial(ctx, addr)
+	// Use the connection manager to get or create a connection
+	conn, isNew, err := c.peerConnMgr.GetOrCreateEx(ctx, msg.Username, addr)
 	if err != nil {
 		// Connection failed - peer might be behind NAT or firewall
 		return
 	}
-	defer conn.Close()
 
-	// Send PeerInit message
-	c.mu.Lock()
-	username := c.username
-	c.mu.Unlock()
-
-	var buf bytes.Buffer
-	w := protocol.NewWriter(&buf)
-	init := &peer.Init{
-		Username: username,
-		Type:     string(msg.Type),
-		Token:    msg.Token,
-	}
-	init.Encode(w)
-	if err := w.Error(); err != nil {
-		return
-	}
-
-	if err := conn.WriteMessage(buf.Bytes()); err != nil {
-		return
-	}
-
-	// Read messages from peer
-	// Set a read deadline to avoid hanging
-	if err := conn.SetDeadline(time.Now().Add(30 * time.Second)); err != nil {
-		return
-	}
-
-	for {
-		payload, err := conn.ReadMessage()
-		if err != nil {
-			return
-		}
-
-		if len(payload) < 4 {
-			continue
-		}
-
-		code := binary.LittleEndian.Uint32(payload[:4])
-
-		// Handle search response
-		if code == uint32(protocol.PeerSearchResponse) {
-			c.handleSearchResponse(payload)
-			return // Search response received, close connection
-		}
-
-		// Other peer messages can be handled here in the future
+	// Start message handler only if we created a new connection
+	// Existing/cached connections already have a handler running
+	if isNew {
+		go c.handleIncomingPeerMessages(conn, msg.Username)
 	}
 }

@@ -21,52 +21,6 @@ import (
 // transferToken is an atomic counter for generating unique transfer tokens.
 var transferToken uint32
 
-// TransferState represents the current state of a download.
-type TransferState int
-
-const (
-	// TransferStateQueued indicates the download is queued locally.
-	TransferStateQueued TransferState = iota
-	// TransferStateRequested indicates the download request has been sent.
-	TransferStateRequested
-	// TransferStateQueuedRemotely indicates the file is in the peer's upload queue.
-	TransferStateQueuedRemotely
-	// TransferStateConnecting indicates we're establishing the transfer connection.
-	TransferStateConnecting
-	// TransferStateTransferring indicates the file is being transferred.
-	TransferStateTransferring
-	// TransferStateCompleted indicates the download completed successfully.
-	TransferStateCompleted
-	// TransferStateFailed indicates the download failed.
-	TransferStateFailed
-	// TransferStateCancelled indicates the download was cancelled.
-	TransferStateCancelled
-)
-
-// String returns a human-readable state name.
-func (s TransferState) String() string {
-	switch s {
-	case TransferStateQueued:
-		return "queued"
-	case TransferStateRequested:
-		return "requested"
-	case TransferStateQueuedRemotely:
-		return "queued_remotely"
-	case TransferStateConnecting:
-		return "connecting"
-	case TransferStateTransferring:
-		return "transferring"
-	case TransferStateCompleted:
-		return "completed"
-	case TransferStateFailed:
-		return "failed"
-	case TransferStateCancelled:
-		return "cancelled"
-	default:
-		return "unknown"
-	}
-}
-
 // DownloadProgress represents the current state and progress of a download.
 type DownloadProgress struct {
 	State            TransferState
@@ -247,7 +201,7 @@ func (c *Client) Download(ctx context.Context, username, filename string, w io.W
 		ctx:             dlCtx,
 		cancel:          cancel,
 		writer:          w,
-		state:           TransferStateQueued,
+		state:           TransferStateQueued | TransferStateLocally,
 	}
 
 	// Register the download
@@ -267,12 +221,12 @@ func (c *Client) runDownload(dl *activeDownload) {
 	}()
 
 	// Send initial progress
-	dl.sendProgress(TransferStateQueued, 0, 0, 0, nil)
+	dl.sendProgress(TransferStateQueued|TransferStateLocally, 0, 0, 0, nil)
 
 	// Step 1: Get peer address from server
 	peerAddr, err := c.getPeerAddress(dl.ctx, dl.username)
 	if err != nil {
-		dl.sendProgress(TransferStateFailed, 0, 0, 0, fmt.Errorf("get peer address: %w", err))
+		dl.sendProgress(TransferStateCompleted|TransferStateErrored, 0, 0, 0, fmt.Errorf("get peer address: %w", err))
 		return
 	}
 
@@ -281,30 +235,30 @@ func (c *Client) runDownload(dl *activeDownload) {
 
 	peerConn, err := c.connectToPeerForDownload(dl.ctx, peerAddr, dl)
 	if err != nil {
-		dl.sendProgress(TransferStateFailed, 0, 0, 0, fmt.Errorf("connect to peer: %w", err))
+		dl.sendProgress(TransferStateCompleted|TransferStateErrored, 0, 0, 0, fmt.Errorf("connect to peer: %w", err))
 		return
 	}
 	defer peerConn.Close()
 
 	// Step 3: Send TransferRequest
 	if err := c.sendTransferRequest(peerConn, dl); err != nil {
-		dl.sendProgress(TransferStateFailed, 0, 0, 0, fmt.Errorf("send transfer request: %w", err))
+		dl.sendProgress(TransferStateCompleted|TransferStateErrored, 0, 0, 0, fmt.Errorf("send transfer request: %w", err))
 		return
 	}
 
 	// Step 4: Wait for response
 	resp, err := c.waitForTransferResponse(dl.ctx, peerConn, dl.token)
 	if err != nil {
-		dl.sendProgress(TransferStateFailed, 0, 0, 0, fmt.Errorf("wait for response: %w", err))
+		dl.sendProgress(TransferStateCompleted|TransferStateErrored, 0, 0, 0, fmt.Errorf("wait for response: %w", err))
 		return
 	}
 
 	if err := c.handleTransferResponse(resp, peerAddr, peerConn, dl); err != nil {
-		dl.sendProgress(TransferStateFailed, dl.fileSize, 0, 0, err)
+		dl.sendProgress(TransferStateCompleted|TransferStateErrored, dl.fileSize, 0, 0, err)
 		return
 	}
 
-	dl.sendProgress(TransferStateCompleted, dl.fileSize, dl.fileSize, 0, nil)
+	dl.sendProgress(TransferStateCompleted|TransferStateSucceeded, dl.fileSize, dl.fileSize, 0, nil)
 }
 
 // handleTransferResponse processes the peer's transfer response.
@@ -320,7 +274,7 @@ func (c *Client) handleTransferResponse(resp *peer.TransferResponse, peerAddr st
 	}
 
 	// File is queued - wait for peer to initiate transfer
-	dl.sendProgress(TransferStateQueuedRemotely, 0, 0, 0, nil)
+	dl.sendProgress(TransferStateQueued|TransferStateRemotely, 0, 0, 0, nil)
 	return c.waitForPeerTransfer(dl.ctx, peerAddr, peerConn, dl)
 }
 
@@ -391,172 +345,23 @@ func (c *Client) getPeerAddress(ctx context.Context, username string) (string, e
 }
 
 // connectToPeerForDownload establishes a peer connection for downloading.
-// It tries both direct and indirect connections simultaneously.
+// Uses the connection manager for caching and parallel direct+indirect strategy.
 func (c *Client) connectToPeerForDownload(ctx context.Context, addr string, dl *activeDownload) (*connection.Conn, error) {
-	// Create channels for results
-	type connResult struct {
-		conn     *connection.Conn
-		isDirect bool
-		err      error
-	}
-	resultCh := make(chan connResult, 2)
-
-	// Create cancellation contexts for each method
-	directCtx, cancelDirect := context.WithCancel(ctx)
-	defer cancelDirect()
-	indirectCtx, cancelIndirect := context.WithCancel(ctx)
-	defer cancelIndirect()
-
-	// Attempt direct connection
-	go func() {
-		conn, err := c.connectToPeerDirect(directCtx, addr, dl)
-		select {
-		case resultCh <- connResult{conn: conn, isDirect: true, err: err}:
-		case <-directCtx.Done():
-			if conn != nil {
-				conn.Close()
-			}
-		}
-	}()
-
-	// Attempt indirect connection (via server solicitation)
-	go func() {
-		conn, err := c.connectToPeerIndirect(indirectCtx, dl)
-		select {
-		case resultCh <- connResult{conn: conn, isDirect: false, err: err}:
-		case <-indirectCtx.Done():
-			if conn != nil {
-				conn.Close()
-			}
-		}
-	}()
-
-	// Wait for first successful connection
-	var directErr, indirectErr error
-	for range 2 {
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case result := <-resultCh:
-			if result.err == nil && result.conn != nil {
-				// Success! Cancel the other method
-				if result.isDirect {
-					cancelIndirect()
-				} else {
-					cancelDirect()
-				}
-				return result.conn, nil
-			}
-			// Track errors
-			if result.isDirect {
-				directErr = result.err
-			} else {
-				indirectErr = result.err
-			}
-		}
-	}
-
-	// Both failed
-	if directErr != nil && indirectErr != nil {
-		return nil, errors.Join(
-			fmt.Errorf("direct: %w", directErr),
-			fmt.Errorf("indirect: %w", indirectErr),
-		)
-	}
-	if directErr != nil {
-		return nil, fmt.Errorf("direct: %w", directErr)
-	}
-	return nil, fmt.Errorf("indirect: %w", indirectErr)
-}
-
-// connectToPeerDirect attempts a direct TCP connection to the peer.
-func (c *Client) connectToPeerDirect(ctx context.Context, addr string, dl *activeDownload) (*connection.Conn, error) {
-	conn, err := connection.Dial(ctx, addr)
+	// Use the connection manager which handles:
+	// - Connection caching per username
+	// - Parallel direct+indirect strategy
+	// - Connection deduplication for concurrent requests
+	conn, isNew, err := c.peerConnMgr.GetOrCreateEx(ctx, dl.username, addr)
 	if err != nil {
 		return nil, err
 	}
 
-	// Send PeerInit
-	c.mu.Lock()
-	username := c.username
-	c.mu.Unlock()
-
-	var buf bytes.Buffer
-	w := protocol.NewWriter(&buf)
-	init := &peer.Init{
-		Username: username,
-		Type:     "P",
-		Token:    dl.token,
-	}
-	init.Encode(w)
-	if err := w.Error(); err != nil {
-		conn.Close()
-		return nil, err
-	}
-
-	if err := conn.WriteMessage(buf.Bytes()); err != nil {
-		conn.Close()
-		return nil, err
+	// Start message handler only if we created a new connection
+	if isNew {
+		go c.handleIncomingPeerMessages(conn, dl.username)
 	}
 
 	return conn, nil
-}
-
-// connectToPeerIndirect solicits a connection via the server.
-// The server tells the peer to connect to us, and we receive the connection via our listener.
-func (c *Client) connectToPeerIndirect(ctx context.Context, dl *activeDownload) (*connection.Conn, error) {
-	// Check if we have a listener running
-	if c.ListenerPort() == 0 {
-		return nil, errors.New("no listener running for indirect connections")
-	}
-
-	// Generate a solicitation token
-	solicitToken := atomic.AddUint32(&transferToken, 1)
-
-	// Create a channel to receive the incoming connection
-	connCh := make(chan *connection.Conn, 1)
-
-	// Register the pending solicitation
-	c.solicitations.mu.Lock()
-	c.solicitations.pending[solicitToken] = connCh
-	c.solicitations.mu.Unlock()
-
-	// Clean up on exit
-	defer func() {
-		c.solicitations.mu.Lock()
-		delete(c.solicitations.pending, solicitToken)
-		c.solicitations.mu.Unlock()
-	}()
-
-	// Send ConnectToPeerRequest to the server
-	var buf bytes.Buffer
-	w := protocol.NewWriter(&buf)
-	req := &server.ConnectToPeerRequest{
-		Token:    solicitToken,
-		Username: dl.username,
-		Type:     server.ConnectionTypePeer,
-	}
-	req.Encode(w)
-	if err := w.Error(); err != nil {
-		return nil, err
-	}
-
-	if err := c.WriteMessage(buf.Bytes()); err != nil {
-		return nil, fmt.Errorf("send connect request: %w", err)
-	}
-
-	// Wait for the peer to connect to us
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case conn := <-connCh:
-		if conn == nil {
-			return nil, errors.New("connection closed")
-		}
-		return conn, nil
-	case <-time.After(30 * time.Second):
-		return nil, errors.New("indirect connection timeout")
-	}
 }
 
 // sendTransferRequest sends a download request to the peer.
@@ -653,21 +458,21 @@ func (c *Client) waitForPeerTransfer(ctx context.Context, peerAddr string, conn 
 			case info := <-dl.transferReadyCh:
 				log.Printf("[DEBUG] waitForPeerTransfer: got signal despite error, remoteToken=%d", info.remoteToken)
 				dl.fileSize = info.fileSize
-				dl.sendProgress(TransferStateConnecting, dl.fileSize, 0, 0, nil)
+				dl.sendProgress(TransferStateInitializing, dl.fileSize, 0, 0, nil)
 				return c.waitForTransferConnection(ctx, peerAddr, dl)
 			default:
 				return err
 			}
 		}
 		// No error means we got TransferRequest on this connection and it was handled
-		dl.sendProgress(TransferStateConnecting, dl.fileSize, 0, 0, nil)
+		dl.sendProgress(TransferStateInitializing, dl.fileSize, 0, 0, nil)
 		return c.waitForTransferConnection(ctx, peerAddr, dl)
 
 	case info := <-dl.transferReadyCh:
 		// TransferRequest(Upload) arrived on some connection (maybe this one, maybe another)
 		log.Printf("[DEBUG] waitForPeerTransfer: got transferReadyCh signal, remoteToken=%d, fileSize=%d", info.remoteToken, info.fileSize)
 		dl.fileSize = info.fileSize
-		dl.sendProgress(TransferStateConnecting, dl.fileSize, 0, 0, nil)
+		dl.sendProgress(TransferStateInitializing, dl.fileSize, 0, 0, nil)
 		return c.waitForTransferConnection(ctx, peerAddr, dl)
 	}
 }
@@ -742,7 +547,7 @@ func (c *Client) readPeerMessagesUntilReady(conn *connection.Conn, dl *activeDow
 				continue
 			}
 			if resp.Filename == dl.filename {
-				dl.sendProgress(TransferStateQueuedRemotely, 0, 0, resp.Place, nil)
+				dl.sendProgress(TransferStateQueued|TransferStateRemotely, 0, 0, resp.Place, nil)
 			}
 
 		case uint32(protocol.PeerUploadDenied):
@@ -790,7 +595,7 @@ func (c *Client) waitForTransferConnection(ctx context.Context, peerAddr string,
 	log.Printf("[DEBUG] waitForTransferConnection: offset sent, receiving file data")
 
 	// Receive file data
-	dl.sendProgress(TransferStateTransferring, dl.fileSize, 0, 0, nil)
+	dl.sendProgress(TransferStateInProgress, dl.fileSize, 0, 0, nil)
 	return c.receiveFileData(ctx, conn, dl)
 }
 
@@ -1077,7 +882,7 @@ func (c *Client) dialTransferConnection(ctx context.Context, peerAddr string, re
 // This is used for immediate transfers (when the uploader responds with Allowed=true).
 // In this case, WE initiate the F-type connection using OUR token.
 func (c *Client) performTransfer(ctx context.Context, peerAddr string, dl *activeDownload) error {
-	dl.sendProgress(TransferStateConnecting, dl.fileSize, 0, 0, nil)
+	dl.sendProgress(TransferStateInitializing, dl.fileSize, 0, 0, nil)
 
 	log.Printf("[DEBUG] performTransfer: starting immediate transfer to %s with our token=%d", peerAddr, dl.token)
 
@@ -1136,7 +941,7 @@ func (c *Client) performTransfer(ctx context.Context, peerAddr string, dl *activ
 	log.Printf("[DEBUG] performTransfer: offset sent, receiving file data")
 
 	// Receive file data
-	dl.sendProgress(TransferStateTransferring, dl.fileSize, 0, 0, nil)
+	dl.sendProgress(TransferStateInProgress, dl.fileSize, 0, 0, nil)
 
 	return c.receiveFileData(ctx, conn, dl)
 }
@@ -1182,7 +987,7 @@ func (c *Client) receiveFileData(ctx context.Context, conn *connection.Conn, dl 
 
 		// Send progress update (throttled to avoid flooding)
 		if time.Since(lastUpdate) > 100*time.Millisecond {
-			dl.sendProgress(TransferStateTransferring, dl.fileSize, received, 0, nil)
+			dl.sendProgress(TransferStateInProgress, dl.fileSize, received, 0, nil)
 			lastUpdate = time.Now()
 		}
 	}

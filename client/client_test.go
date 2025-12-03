@@ -104,3 +104,14 @@ func TestOptions_Constants(t *testing.T) {
 	assert.Equal(t, 10*time.Second, client.DefaultConnectTimeout)
 	assert.Equal(t, 5*time.Second, client.DefaultMessageTimeout)
 }
+
+func TestClient_Transfers(t *testing.T) {
+	c := client.New(nil)
+
+	transfers := c.Transfers()
+	assert.NotNil(t, transfers)
+
+	// Registry should be empty initially
+	all := transfers.All()
+	assert.Empty(t, all)
+}
