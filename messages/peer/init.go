@@ -19,3 +19,15 @@ func (m *Init) Encode(w *protocol.Writer) {
 	w.WriteString(m.Type)
 	w.WriteUint32(m.Token)
 }
+
+// PierceFirewall is sent when connecting to a peer via the server's ConnectToPeer instruction.
+// This is used for NAT traversal when direct connections fail.
+type PierceFirewall struct {
+	Token uint32 // Token from ConnectToPeer message
+}
+
+// Encode writes the PierceFirewall message.
+func (m *PierceFirewall) Encode(w *protocol.Writer) {
+	w.WriteUint8(uint8(protocol.InitPierceFirewall)) // 1-byte init code (0)
+	w.WriteUint32(m.Token)
+}

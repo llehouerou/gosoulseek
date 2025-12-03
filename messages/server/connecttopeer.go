@@ -28,6 +28,23 @@ type ConnectToPeer struct {
 	IsPrivileged bool
 }
 
+// ConnectToPeerRequest is sent to the server to request a peer connection.
+// This is used when we can't connect directly to a peer (e.g., they're behind NAT).
+// The server will tell the peer to connect to us instead.
+type ConnectToPeerRequest struct {
+	Token    uint32         // Our token for this connection request
+	Username string         // Username of the peer to connect to
+	Type     ConnectionType // Connection type (P/F/D)
+}
+
+// Encode writes the ConnectToPeerRequest message.
+func (m *ConnectToPeerRequest) Encode(w *protocol.Writer) {
+	w.WriteUint32(uint32(protocol.ServerConnectToPeer))
+	w.WriteUint32(m.Token)
+	w.WriteString(m.Username)
+	w.WriteString(string(m.Type))
+}
+
 // DecodeConnectToPeer parses a ConnectToPeer message from the server.
 func DecodeConnectToPeer(r *protocol.Reader) (*ConnectToPeer, error) {
 	code := r.ReadUint32()

@@ -81,6 +81,15 @@ func run() error {
 	fmt.Printf("  Username:  %s\n", c.Username())
 	fmt.Printf("  Public IP: %s\n", c.IPAddress())
 	fmt.Printf("  Supporter: %v\n", c.IsSupporter())
+
+	// Start listener for incoming peer connections if port configured
+	if *listenPort > 0 {
+		if err := c.StartListener(); err != nil {
+			return fmt.Errorf("start listener: %w", err)
+		}
+		defer func() { _ = c.StopListener() }()
+		fmt.Printf("  Listener:  port %d\n", c.ListenerPort())
+	}
 	fmt.Println()
 
 	// If no search query, just wait for signals
@@ -114,10 +123,11 @@ func run() error {
 		fileCount += len(resp.Files)
 		printSearchResponse(resultCount, resp)
 
-		// Save first result for potential download
-		if firstResult == nil && len(resp.Files) > 0 {
+		// Save first result from a user with free slot (no queue) for potential download
+		if firstResult == nil && len(resp.Files) > 0 && resp.HasFreeSlot && resp.QueueLength == 0 {
 			firstResult = resp
 			firstFile = &resp.Files[0]
+			fmt.Printf("  ^^^ Selected for download (free slot, no queue)\n")
 		}
 	}
 

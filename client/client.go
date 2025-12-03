@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"sync"
 	"time"
@@ -18,12 +19,15 @@ import (
 
 // Client represents a Soulseek client connection.
 type Client struct {
-	opts      *Options
-	conn      *connection.Conn
-	router    *MessageRouter
-	searches  *searchRegistry
-	downloads *downloadRegistry
-	mu        sync.Mutex
+	opts          *Options
+	conn          *connection.Conn
+	router        *MessageRouter
+	searches      *searchRegistry
+	downloads     *downloadRegistry
+	listener      *Listener
+	solicitations *pendingSolicitations // Pending connections WE solicited
+	peerSolicits  *pendingPeerSolicits  // Pending connections PEER solicited (from ConnectToPeer)
+	mu            sync.Mutex
 
 	// Read loop management
 	stopCh  chan struct{}
@@ -48,12 +52,16 @@ func New(opts *Options) *Client {
 	if opts == nil {
 		opts = DefaultOptions()
 	}
-	return &Client{
-		opts:      opts,
-		router:    NewMessageRouter(),
-		searches:  newSearchRegistry(),
-		downloads: newDownloadRegistry(),
+	c := &Client{
+		opts:          opts,
+		router:        NewMessageRouter(),
+		searches:      newSearchRegistry(),
+		downloads:     newDownloadRegistry(),
+		solicitations: newPendingSolicitations(),
+		peerSolicits:  newPendingPeerSolicits(),
 	}
+	c.listener = newListener(c)
+	return c
 }
 
 // Router returns the message router for registering custom handlers.
@@ -389,4 +397,260 @@ func (c *Client) WriteMessage(payload []byte) error {
 	}
 
 	return c.conn.WriteMessage(payload)
+}
+
+// StartListener starts the TCP listener for incoming peer connections.
+// This is required for downloads to work when peers need to connect to us.
+func (c *Client) StartListener() error {
+	if c.opts.ListenPort == 0 {
+		return errors.New("listen port not configured")
+	}
+	return c.listener.Start(c.opts.ListenPort)
+}
+
+// StopListener stops the TCP listener.
+func (c *Client) StopListener() error {
+	return c.listener.Stop()
+}
+
+// ListenerPort returns the port the listener is bound to, or 0 if not running.
+func (c *Client) ListenerPort() int {
+	return c.listener.Port()
+}
+
+// pendingSolicitations tracks pending solicited peer connections.
+// These are connections we requested via the server (e.g., for search results).
+type pendingSolicitations struct {
+	mu      sync.Mutex
+	pending map[uint32]chan *connection.Conn // by token
+}
+
+func newPendingSolicitations() *pendingSolicitations {
+	return &pendingSolicitations{
+		pending: make(map[uint32]chan *connection.Conn),
+	}
+}
+
+// pendingPeerSolicit represents a pending connection that a PEER solicited.
+// The server sent us ConnectToPeer telling us to connect to the peer,
+// but the peer might connect to us first via PierceFirewall.
+type pendingPeerSolicit struct {
+	username string
+	connType server.ConnectionType // "P", "F", or "D"
+}
+
+// pendingPeerSolicits tracks pending peer-solicited connections.
+// When we receive ConnectToPeer from the server, we store the token and type here.
+// When we receive PierceFirewall with a matching token, we know what type of connection it is.
+type pendingPeerSolicits struct {
+	mu      sync.Mutex
+	pending map[uint32]pendingPeerSolicit // by token
+}
+
+func newPendingPeerSolicits() *pendingPeerSolicits {
+	return &pendingPeerSolicits{
+		pending: make(map[uint32]pendingPeerSolicit),
+	}
+}
+
+// add registers a pending peer-solicited connection.
+func (p *pendingPeerSolicits) add(token uint32, username string, connType server.ConnectionType) {
+	p.mu.Lock()
+	p.pending[token] = pendingPeerSolicit{username: username, connType: connType}
+	p.mu.Unlock()
+}
+
+// get retrieves and removes a pending peer-solicited connection.
+func (p *pendingPeerSolicits) get(token uint32) (pendingPeerSolicit, bool) {
+	p.mu.Lock()
+	solicit, ok := p.pending[token]
+	if ok {
+		delete(p.pending, token)
+	}
+	p.mu.Unlock()
+	return solicit, ok
+}
+
+// complete delivers a connection to a pending solicitation.
+// Returns true if there was a pending solicitation for the token.
+func (p *pendingSolicitations) complete(token uint32, conn *connection.Conn) bool {
+	p.mu.Lock()
+	ch, ok := p.pending[token]
+	if ok {
+		delete(p.pending, token)
+	}
+	p.mu.Unlock()
+
+	if ok {
+		select {
+		case ch <- conn:
+			return true
+		default:
+		}
+	}
+	return false
+}
+
+// completePendingSolicitation is called when an incoming PierceFirewall connection arrives.
+// This handles connections initiated via the server's ConnectToPeer instruction.
+func (c *Client) completePendingSolicitation(token uint32, conn *connection.Conn) bool {
+	return c.solicitations.complete(token, conn)
+}
+
+// handleIncomingPeerMessages reads and dispatches messages from an incoming peer connection.
+func (c *Client) handleIncomingPeerMessages(conn *connection.Conn, username string) {
+	for {
+		// Set a read deadline for each message - 5 minutes to allow for queued transfers
+		if err := conn.SetDeadline(time.Now().Add(5 * time.Minute)); err != nil {
+			return
+		}
+
+		payload, err := conn.ReadMessage()
+		if err != nil {
+			return
+		}
+
+		if len(payload) < 4 {
+			continue
+		}
+
+		code := binary.LittleEndian.Uint32(payload[:4])
+
+		// Handle peer messages
+		switch code {
+		case uint32(protocol.PeerSearchResponse):
+			c.handleSearchResponse(payload)
+			// Don't return - keep connection open for potential transfer messages
+
+		case uint32(protocol.PeerTransferRequest):
+			c.handlePeerTransferRequestWithConn(payload, username, conn)
+
+		case uint32(protocol.PeerTransferResponse):
+			// Handle transfer response from peer
+			// This is handled by the download flow directly
+
+		case uint32(protocol.PeerPlaceInQueueResponse):
+			c.handlePlaceInQueueResponse(payload, username)
+
+		case uint32(protocol.PeerUploadDenied):
+			c.handleUploadDenied(payload, username)
+
+		case uint32(protocol.PeerUploadFailed):
+			c.handleUploadFailed(payload, username)
+		}
+	}
+}
+
+// handlePeerTransferRequestWithConn handles TransferRequest messages from peers.
+// When a peer sends TransferRequest with Upload direction, they're ready to send us a file.
+// This can arrive on ANY message connection from the peer, not just the one we established.
+func (c *Client) handlePeerTransferRequestWithConn(payload []byte, username string, conn *connection.Conn) {
+	req, err := peer.DecodeTransferRequest(payload)
+	if err != nil {
+		log.Printf("[DEBUG] handlePeerTransferRequest: decode failed: %v", err)
+		return
+	}
+	log.Printf("[DEBUG] handlePeerTransferRequest: from %s, direction=%d, filename=%s, token=%d, fileSize=%d",
+		username, req.Direction, req.Filename, req.Token, req.FileSize)
+
+	// Only handle Upload direction (peer is offering to send us a file)
+	if req.Direction != peer.TransferUpload {
+		log.Printf("[DEBUG] handlePeerTransferRequest: ignoring non-upload direction %d", req.Direction)
+		return
+	}
+
+	// Find the matching download by username and filename
+	dl := c.downloads.getByFile(username, req.Filename)
+	if dl == nil {
+		log.Printf("[DEBUG] handlePeerTransferRequest: no matching download for %s/%s", username, req.Filename)
+		// Send rejection if we have a connection
+		if conn != nil {
+			var buf bytes.Buffer
+			w := protocol.NewWriter(&buf)
+			resp := &peer.TransferResponse{
+				Token:   req.Token,
+				Allowed: false,
+				Reason:  "Cancelled",
+			}
+			resp.Encode(w)
+			if w.Error() == nil {
+				_ = conn.WriteMessage(buf.Bytes())
+			}
+		}
+		return
+	}
+
+	// Store the remote token - this is what we'll use to match the transfer connection
+	log.Printf("[DEBUG] handlePeerTransferRequest: setting remoteToken=%d for download", req.Token)
+	c.downloads.setRemoteToken(dl, req.Token)
+
+	// Send TransferResponse if we have a connection
+	if conn != nil {
+		var buf bytes.Buffer
+		w := protocol.NewWriter(&buf)
+		resp := &peer.TransferResponse{
+			Token:    req.Token,
+			Allowed:  true,
+			FileSize: req.FileSize,
+		}
+		resp.Encode(w)
+		if err := w.Error(); err == nil {
+			if err := conn.WriteMessage(buf.Bytes()); err != nil {
+				log.Printf("[DEBUG] handlePeerTransferRequest: failed to send response: %v", err)
+			} else {
+				log.Printf("[DEBUG] handlePeerTransferRequest: sent TransferResponse Allowed=true for token=%d", req.Token)
+			}
+		}
+	}
+
+	// Signal the download that TransferRequest(Upload) has arrived
+	// This unblocks waitForPeerTransfer which may be waiting on a different connection
+	select {
+	case dl.transferReadyCh <- transferReadyInfo{remoteToken: req.Token, fileSize: req.FileSize}:
+		log.Printf("[DEBUG] handlePeerTransferRequest: signaled transferReadyCh for download")
+	default:
+		log.Printf("[DEBUG] handlePeerTransferRequest: transferReadyCh already has a value")
+	}
+
+	// Update progress
+	dl.sendProgress(TransferStateConnecting, req.FileSize, 0, 0, nil)
+}
+
+// handlePlaceInQueueResponse handles queue position updates.
+func (c *Client) handlePlaceInQueueResponse(payload []byte, username string) {
+	resp, err := peer.DecodePlaceInQueueResponse(payload)
+	if err != nil {
+		return
+	}
+
+	dl := c.downloads.getByFile(username, resp.Filename)
+	if dl != nil {
+		dl.sendProgress(TransferStateQueuedRemotely, dl.fileSize, 0, resp.Place, nil)
+	}
+}
+
+// handleUploadDenied handles upload denial messages.
+func (c *Client) handleUploadDenied(payload []byte, username string) {
+	denied, err := peer.DecodeUploadDenied(payload)
+	if err != nil {
+		return
+	}
+
+	dl := c.downloads.getByFile(username, denied.Filename)
+	if dl != nil {
+		dl.sendProgress(TransferStateFailed, dl.fileSize, 0, 0, fmt.Errorf("upload denied: %s", denied.Reason))
+	}
+}
+
+// handleUploadFailed handles upload failure messages.
+func (c *Client) handleUploadFailed(payload []byte, username string) {
+	failed, err := peer.DecodeUploadFailed(payload)
+	if err != nil {
+		return
+	}
+
+	dl := c.downloads.getByFile(username, failed.Filename)
+	if dl != nil {
+		dl.sendProgress(TransferStateFailed, dl.fileSize, 0, 0, errors.New("upload failed"))
+	}
 }
