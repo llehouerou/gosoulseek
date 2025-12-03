@@ -491,12 +491,6 @@ func (p *pendingSolicitations) complete(token uint32, conn *connection.Conn) boo
 	return false
 }
 
-// completePendingSolicitation is called when an incoming PierceFirewall connection arrives.
-// This handles connections initiated via the server's ConnectToPeer instruction.
-func (c *Client) completePendingSolicitation(token uint32, conn *connection.Conn) bool {
-	return c.solicitations.complete(token, conn)
-}
-
 // handleIncomingPeerMessages reads and dispatches messages from an incoming peer connection.
 func (c *Client) handleIncomingPeerMessages(conn *connection.Conn, username string) {
 	for {

@@ -170,20 +170,6 @@ func (r *downloadRegistry) getByFile(username, filename string) *activeDownload 
 	return dl
 }
 
-// getByAnyRemoteToken finds a download by remote token only (without username).
-// This is used for PierceFirewall connections where we don't know the username.
-func (r *downloadRegistry) getByAnyRemoteToken(remoteToken uint32) *activeDownload {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-
-	for _, dl := range r.downloads {
-		if dl.hasRemoteToken && dl.remoteToken == remoteToken {
-			return dl
-		}
-	}
-	return nil
-}
-
 func (r *downloadRegistry) remove(dl *activeDownload) {
 	r.mu.Lock()
 	delete(r.downloads, dl.token)
