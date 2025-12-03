@@ -18,16 +18,17 @@ import (
 
 // Client represents a Soulseek client connection.
 type Client struct {
-	opts          *Options
-	conn          *connection.Conn
-	router        *MessageRouter
-	searches      *searchRegistry
-	transfers     *TransferRegistry // Unified transfer tracking
-	listener      *Listener
-	peerConnMgr   *peerConnManager      // Manages P-type connections to peers
-	solicitations *pendingSolicitations // Pending connections WE solicited
-	peerSolicits  *pendingPeerSolicits  // Pending connections PEER solicited (from ConnectToPeer)
-	mu            sync.Mutex
+	opts            *Options
+	conn            *connection.Conn
+	router          *MessageRouter
+	searches        *searchRegistry
+	transfers       *TransferRegistry // Unified transfer tracking
+	listener        *Listener
+	peerConnMgr     *peerConnManager           // Manages P-type connections to peers
+	transferConnMgr *TransferConnectionManager // Manages F-type transfer connections
+	solicitations   *pendingSolicitations      // Pending connections WE solicited
+	peerSolicits    *pendingPeerSolicits       // Pending connections PEER solicited (from ConnectToPeer)
+	mu              sync.Mutex
 
 	// Read loop management
 	stopCh  chan struct{}
@@ -61,6 +62,7 @@ func New(opts *Options) *Client {
 		peerSolicits:  newPendingPeerSolicits(),
 	}
 	c.peerConnMgr = newPeerConnManager(c)
+	c.transferConnMgr = NewTransferConnectionManager(c)
 	c.listener = newListener(c)
 	return c
 }

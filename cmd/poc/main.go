@@ -34,7 +34,7 @@ func run() error {
 	serverAddr := flag.String("server", client.DefaultServerAddress, "Soulseek server address")
 	listenPort := flag.Uint("port", 0, "Listen port for incoming connections (0 = disabled)")
 	searchQuery := flag.String("search", "", "Search query (if empty, just login and wait)")
-	searchTimeout := flag.Duration("timeout", 30*time.Second, "Search timeout")
+	searchTimeout := flag.Duration("timeout", 5*time.Second, "Search timeout")
 	downloadFirst := flag.Bool("download", false, "Download the first search result")
 	outputDir := flag.String("out", ".", "Output directory for downloads")
 	flag.Parse()

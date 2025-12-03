@@ -185,14 +185,14 @@ func (o *downloadOrchestrator) getPeerAddress() error {
 }
 
 // connectToPeer establishes a P-type message connection to the peer.
+// Note: We don't start the global message handler here because the download
+// orchestrator will read from this connection directly in waitForTransferResponse
+// and readPeerMessagesUntilReady. Starting a handler would cause two readers
+// to compete for messages on the same connection.
 func (o *downloadOrchestrator) connectToPeer() (*connection.Conn, error) {
-	conn, isNew, err := o.client.peerConnMgr.GetOrCreateEx(o.ctx, o.transfer.Username, o.peerAddr)
+	conn, _, err := o.client.peerConnMgr.GetOrCreateEx(o.ctx, o.transfer.Username, o.peerAddr)
 	if err != nil {
 		return nil, err
-	}
-
-	if isNew {
-		go o.client.handleIncomingPeerMessages(conn, o.transfer.Username)
 	}
 
 	return conn, nil
@@ -215,6 +215,8 @@ func (o *downloadOrchestrator) sendTransferRequest(conn *connection.Conn) error 
 }
 
 // waitForTransferResponse waits for the peer's response.
+// It races between reading from the P-type connection and receiving a signal
+// via the transfer's ready channel (in case peer connects to us instead).
 func (o *downloadOrchestrator) waitForTransferResponse(conn *connection.Conn) (*peer.TransferResponse, error) {
 	deadline, ok := o.ctx.Deadline()
 	if ok {
@@ -227,32 +229,74 @@ func (o *downloadOrchestrator) waitForTransferResponse(conn *connection.Conn) (*
 		}
 	}
 
-	for {
-		select {
-		case <-o.ctx.Done():
-			return nil, o.ctx.Err()
-		default:
-		}
+	// Channel for response from P-type connection
+	type readResult struct {
+		resp *peer.TransferResponse
+		err  error
+	}
+	readCh := make(chan readResult, 1)
 
-		payload, err := conn.ReadMessage()
-		if err != nil {
-			return nil, err
-		}
-
-		if len(payload) < 4 {
-			continue
-		}
-
-		code := binary.LittleEndian.Uint32(payload[:4])
-		if code == uint32(protocol.PeerTransferResponse) {
-			resp, err := peer.DecodeTransferResponse(payload)
+	go func() {
+		for {
+			payload, err := conn.ReadMessage()
 			if err != nil {
-				return nil, err
+				readCh <- readResult{nil, err}
+				return
 			}
-			if resp.Token == o.transfer.Token {
-				return resp, nil
+
+			if len(payload) < 4 {
+				continue
+			}
+
+			code := binary.LittleEndian.Uint32(payload[:4])
+			if code == uint32(protocol.PeerTransferResponse) {
+				resp, err := peer.DecodeTransferResponse(payload)
+				if err != nil {
+					readCh <- readResult{nil, err}
+					return
+				}
+				if resp.Token == o.transfer.Token {
+					readCh <- readResult{resp, nil}
+					return
+				}
 			}
 		}
+	}()
+
+	// Race: either we get a response on the P-type connection,
+	// or the peer connects to us and signals via the ready channel
+	select {
+	case <-o.ctx.Done():
+		return nil, o.ctx.Err()
+
+	case result := <-readCh:
+		if result.err != nil {
+			// Connection failed - check if peer signaled us via listener
+			select {
+			case info := <-o.transfer.TransferReadyCh():
+				// Peer connected to us instead! Treat as "queued and ready"
+				o.transfer.mu.Lock()
+				o.transfer.Size = info.FileSize
+				o.transfer.RemoteToken = info.RemoteToken
+				o.transfer.mu.Unlock()
+				_ = o.client.transfers.SetRemoteToken(o.transfer.Token, info.RemoteToken)
+				// Return a synthetic "Queued" response so handleTransferResponse proceeds correctly
+				return &peer.TransferResponse{Token: o.transfer.Token, Allowed: false, Reason: "Queued"}, nil
+			default:
+				return nil, result.err
+			}
+		}
+		return result.resp, nil
+
+	case info := <-o.transfer.TransferReadyCh():
+		// Peer connected to us directly! Treat as "queued and ready"
+		o.transfer.mu.Lock()
+		o.transfer.Size = info.FileSize
+		o.transfer.RemoteToken = info.RemoteToken
+		o.transfer.mu.Unlock()
+		_ = o.client.transfers.SetRemoteToken(o.transfer.Token, info.RemoteToken)
+		// Return a synthetic "Queued" response
+		return &peer.TransferResponse{Token: o.transfer.Token, Allowed: false, Reason: "Queued"}, nil
 	}
 }
 
@@ -326,6 +370,16 @@ func (o *downloadOrchestrator) performImmediateTransfer() error {
 
 // waitForQueuedTransfer waits for the peer to initiate the transfer.
 func (o *downloadOrchestrator) waitForQueuedTransfer(peerConn *connection.Conn) error {
+	// Check if we already have the remote token (set by waitForTransferResponse when peer connected to us)
+	o.transfer.mu.RLock()
+	alreadyReady := o.transfer.RemoteToken != 0
+	o.transfer.mu.RUnlock()
+
+	if alreadyReady {
+		log.Printf("[DEBUG] waitForQueuedTransfer: already have remote token, proceeding to transfer connection")
+		return o.waitForTransferConnection()
+	}
+
 	log.Printf("[DEBUG] waitForQueuedTransfer: waiting for TransferRequest(Upload) from %s", o.transfer.Username)
 
 	// Start reading messages from the P-type connection
@@ -459,252 +513,21 @@ func (o *downloadOrchestrator) readPeerMessagesUntilReady(conn *connection.Conn)
 	}
 }
 
-// waitForTransferConnection gets the F-type transfer connection using triple strategy.
+// waitForTransferConnection gets the F-type transfer connection using TransferConnectionManager.
 func (o *downloadOrchestrator) waitForTransferConnection() error {
 	o.transfer.SetState(TransferStateInitializing)
 	o.transfer.emitProgress()
 
-	log.Printf("[DEBUG] waitForTransferConnection: starting triple strategy, peerAddr=%s, remoteToken=%d",
+	log.Printf("[DEBUG] waitForTransferConnection: using TransferConnectionManager, peerAddr=%s, remoteToken=%d",
 		o.peerAddr, o.transfer.RemoteToken)
 
-	conn, err := o.getTransferConnection()
+	conn, err := o.client.transferConnMgr.AwaitConnection(o.ctx, o.transfer, o.peerAddr)
 	if err != nil {
 		return err
 	}
 	defer conn.Close()
 
 	return o.transferData(conn)
-}
-
-// getTransferConnection uses triple strategy to get a transfer connection.
-func (o *downloadOrchestrator) getTransferConnection() (*connection.Conn, error) {
-	type result struct {
-		conn   *connection.Conn
-		method string
-		err    error
-	}
-	resultCh := make(chan result, 3)
-
-	ctx1, cancel1 := context.WithCancel(o.ctx)
-	ctx2, cancel2 := context.WithCancel(o.ctx)
-	ctx3, cancel3 := context.WithCancel(o.ctx)
-	defer cancel1()
-	defer cancel2()
-	defer cancel3()
-
-	// Method 1: Wait for inbound connection
-	go func() {
-		conn, err := o.waitInboundConnection(ctx1)
-		select {
-		case resultCh <- result{conn, "inbound", err}:
-		case <-ctx1.Done():
-			if conn != nil {
-				conn.Close()
-			}
-		}
-	}()
-
-	// Method 2: Connect directly to peer
-	go func() {
-		conn, err := o.connectDirectTransfer(ctx2)
-		select {
-		case resultCh <- result{conn, "direct", err}:
-		case <-ctx2.Done():
-			if conn != nil {
-				conn.Close()
-			}
-		}
-	}()
-
-	// Method 3: Solicited connection via server
-	go func() {
-		conn, err := o.solicitTransferConnection(ctx3)
-		select {
-		case resultCh <- result{conn, "indirect", err}:
-		case <-ctx3.Done():
-			if conn != nil {
-				conn.Close()
-			}
-		}
-	}()
-
-	var errs []error
-	for range 3 {
-		select {
-		case <-o.ctx.Done():
-			return nil, o.ctx.Err()
-		case r := <-resultCh:
-			if r.err == nil && r.conn != nil {
-				cancel1()
-				cancel2()
-				cancel3()
-				log.Printf("[DEBUG] getTransferConnection: success via %s", r.method)
-				return r.conn, nil
-			}
-			errs = append(errs, fmt.Errorf("%s: %w", r.method, r.err))
-		}
-	}
-
-	return nil, errors.Join(errs...)
-}
-
-// waitInboundConnection waits for peer to connect to our listener.
-func (o *downloadOrchestrator) waitInboundConnection(ctx context.Context) (*connection.Conn, error) {
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case conn := <-o.transfer.TransferConnCh():
-		if conn == nil {
-			return nil, errors.New("connection closed")
-		}
-		return conn, nil
-	}
-}
-
-// connectDirectTransfer connects directly to peer for file transfer.
-func (o *downloadOrchestrator) connectDirectTransfer(ctx context.Context) (*connection.Conn, error) {
-	// Wait for remote token
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
-
-	timeout := time.After(30 * time.Second)
-	for {
-		o.transfer.mu.RLock()
-		remoteToken := o.transfer.RemoteToken
-		o.transfer.mu.RUnlock()
-
-		if remoteToken != 0 {
-			return o.dialTransferConnection(ctx, remoteToken)
-		}
-
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-timeout:
-			return nil, errors.New("timeout waiting for remote token")
-		case <-ticker.C:
-		}
-	}
-}
-
-// dialTransferConnection establishes an outbound transfer connection.
-func (o *downloadOrchestrator) dialTransferConnection(ctx context.Context, remoteToken uint32) (*connection.Conn, error) {
-	log.Printf("[DEBUG] dialTransferConnection: dialing %s with remoteToken=%d", o.peerAddr, remoteToken)
-
-	conn, err := connection.Dial(ctx, o.peerAddr)
-	if err != nil {
-		return nil, fmt.Errorf("dial: %w", err)
-	}
-
-	o.client.mu.Lock()
-	username := o.client.username
-	o.client.mu.Unlock()
-
-	var buf bytes.Buffer
-	w := protocol.NewWriter(&buf)
-	init := &peer.Init{
-		Username: username,
-		Type:     "F",
-		Token:    remoteToken,
-	}
-	init.Encode(w)
-	if err := w.Error(); err != nil {
-		conn.Close()
-		return nil, err
-	}
-
-	if err := conn.WriteMessage(buf.Bytes()); err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("send init: %w", err)
-	}
-
-	var tokenBuf [4]byte
-	binary.LittleEndian.PutUint32(tokenBuf[:], remoteToken)
-	if _, err := conn.Write(tokenBuf[:]); err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("send token: %w", err)
-	}
-
-	return conn, nil
-}
-
-// solicitTransferConnection asks server to tell peer to connect to us.
-func (o *downloadOrchestrator) solicitTransferConnection(ctx context.Context) (*connection.Conn, error) {
-	if o.client.ListenerPort() == 0 {
-		return nil, errors.New("no listener running")
-	}
-
-	solicitToken := atomic.AddUint32(&transferToken, 1)
-	log.Printf("[DEBUG] solicitTransferConnection: sending ConnectToPeerRequest type=F, token=%d", solicitToken)
-
-	connCh := make(chan *connection.Conn, 1)
-
-	o.client.solicitations.mu.Lock()
-	o.client.solicitations.pending[solicitToken] = connCh
-	o.client.solicitations.mu.Unlock()
-
-	defer func() {
-		o.client.solicitations.mu.Lock()
-		delete(o.client.solicitations.pending, solicitToken)
-		o.client.solicitations.mu.Unlock()
-	}()
-
-	// Send ConnectToPeerRequest
-	var buf bytes.Buffer
-	w := protocol.NewWriter(&buf)
-	req := &server.ConnectToPeerRequest{
-		Token:    solicitToken,
-		Username: o.transfer.Username,
-		Type:     server.ConnectionTypeTransfer,
-	}
-	req.Encode(w)
-	if err := w.Error(); err != nil {
-		return nil, err
-	}
-	if err := o.client.WriteMessage(buf.Bytes()); err != nil {
-		return nil, fmt.Errorf("send connect request: %w", err)
-	}
-
-	// Wait for connection
-	var conn *connection.Conn
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case conn = <-connCh:
-		if conn == nil {
-			return nil, errors.New("connection closed")
-		}
-	case <-time.After(30 * time.Second):
-		return nil, errors.New("timeout")
-	}
-
-	// Read remote token
-	var tokenBuf [4]byte
-	if err := conn.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
-		conn.Close()
-		return nil, err
-	}
-	if _, err := io.ReadFull(conn, tokenBuf[:]); err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("read token: %w", err)
-	}
-	remoteToken := binary.LittleEndian.Uint32(tokenBuf[:])
-
-	o.transfer.mu.RLock()
-	expectedToken := o.transfer.RemoteToken
-	o.transfer.mu.RUnlock()
-
-	if expectedToken != 0 && remoteToken != expectedToken {
-		conn.Close()
-		return nil, fmt.Errorf("token mismatch: got %d, want %d", remoteToken, expectedToken)
-	}
-
-	if err := conn.SetReadDeadline(time.Time{}); err != nil {
-		conn.Close()
-		return nil, err
-	}
-
-	return conn, nil
 }
 
 // transferData streams data from the connection to the writer.
@@ -830,9 +653,10 @@ func (c *Client) deliverTransferConnection(username string, remoteToken uint32, 
 }
 
 // handleTransferRequest handles TransferRequest messages from peers.
-// When direction is Upload, it signals the corresponding download transfer.
+// When direction is Upload, it signals the corresponding download transfer
+// and sends a TransferResponse to acknowledge we're ready to receive.
 // This is called when the peer is ready to send us a file we requested.
-func (c *Client) handleTransferRequest(payload []byte, username string, _ *connection.Conn) {
+func (c *Client) handleTransferRequest(payload []byte, username string, conn *connection.Conn) {
 	req, err := peer.DecodeTransferRequest(payload)
 	if err != nil {
 		log.Printf("[WARN] handleTransferRequest: decode error: %v", err)
@@ -849,6 +673,25 @@ func (c *Client) handleTransferRequest(payload []byte, username string, _ *conne
 	if !ok {
 		log.Printf("[DEBUG] handleTransferRequest: no pending download for %s from %s", req.Filename, username)
 		return
+	}
+
+	// Send TransferResponse to acknowledge we're ready
+	if conn != nil {
+		var buf bytes.Buffer
+		w := protocol.NewWriter(&buf)
+		resp := &peer.TransferResponse{
+			Token:    req.Token,
+			Allowed:  true,
+			FileSize: req.FileSize,
+		}
+		resp.Encode(w)
+		if err := w.Error(); err != nil {
+			log.Printf("[WARN] handleTransferRequest: encode response error: %v", err)
+		} else if err := conn.WriteMessage(buf.Bytes()); err != nil {
+			log.Printf("[WARN] handleTransferRequest: send response error: %v", err)
+		} else {
+			log.Printf("[DEBUG] handleTransferRequest: sent TransferResponse for %s", req.Filename)
+		}
 	}
 
 	// Signal the transfer with remote token and file size
