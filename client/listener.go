@@ -248,19 +248,6 @@ func (l *Listener) handleTransferConnection(conn *connection.Conn, username stri
 
 	remoteToken := binary.LittleEndian.Uint32(tokenBuf[:])
 
-	// Find the matching download
-	dl := l.client.downloads.getByRemoteToken(username, remoteToken)
-	if dl == nil {
-		conn.Close()
-		return
-	}
-
-	// Deliver connection to the download
-	select {
-	case dl.transferConnCh <- conn:
-		// Connection handed off successfully
-	default:
-		// Channel full or closed
-		conn.Close()
-	}
+	// Deliver connection via TransferRegistry
+	l.client.deliverTransferConnection(username, remoteToken, conn)
 }

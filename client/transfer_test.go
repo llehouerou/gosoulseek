@@ -247,3 +247,54 @@ func TestTransfer_Progress_Channel(t *testing.T) {
 		t.Error("Expected to receive progress update")
 	}
 }
+
+func TestTransfer_InitDownloadChannels(t *testing.T) {
+	tr := NewTransfer(peer.TransferDownload, "user", "file", 1)
+
+	// Initially channels should be nil
+	if tr.TransferReadyCh() != nil {
+		t.Error("TransferReadyCh should be nil before InitDownloadChannels")
+	}
+	if tr.TransferConnCh() != nil {
+		t.Error("TransferConnCh should be nil before InitDownloadChannels")
+	}
+
+	// Initialize channels
+	tr.InitDownloadChannels()
+
+	// Now channels should be non-nil
+	if tr.TransferReadyCh() == nil {
+		t.Error("TransferReadyCh should be non-nil after InitDownloadChannels")
+	}
+	if tr.TransferConnCh() == nil {
+		t.Error("TransferConnCh should be non-nil after InitDownloadChannels")
+	}
+}
+
+func TestTransfer_TransferReadyCh_Signaling(t *testing.T) {
+	tr := NewTransfer(peer.TransferDownload, "user", "file", 1)
+	tr.InitDownloadChannels()
+
+	info := TransferReadyInfo{RemoteToken: 12345, FileSize: 1000}
+
+	// Send signal
+	select {
+	case tr.TransferReadyCh() <- info:
+		// sent
+	default:
+		t.Fatal("TransferReadyCh should accept signal")
+	}
+
+	// Receive signal
+	select {
+	case received := <-tr.TransferReadyCh():
+		if received.RemoteToken != 12345 {
+			t.Errorf("RemoteToken = %d, want 12345", received.RemoteToken)
+		}
+		if received.FileSize != 1000 {
+			t.Errorf("FileSize = %d, want 1000", received.FileSize)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Error("Expected to receive TransferReadyInfo")
+	}
+}

@@ -186,7 +186,10 @@ func downloadFile(ctx context.Context, c *client.Client, username string, file *
 		// Check active states
 		switch {
 		case p.State&client.TransferStateInProgress != 0:
-			pct := p.PercentComplete()
+			var pct float64
+			if p.FileSize > 0 {
+				pct = float64(p.BytesTransferred) / float64(p.FileSize) * 100
+			}
 			fmt.Printf("  Progress: %.1f%% (%d / %d bytes)\r", pct, p.BytesTransferred, p.FileSize)
 		case p.State&client.TransferStateInitializing != 0:
 			fmt.Println("  Status: connecting for transfer")

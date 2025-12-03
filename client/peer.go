@@ -90,28 +90,11 @@ func (c *Client) connectToPeerForTransfer(msg *server.ConnectToPeer) {
 	remoteToken := binary.LittleEndian.Uint32(tokenBuf[:])
 	fmt.Printf("[DEBUG] connectToPeerForTransfer: received remoteToken=%d\n", remoteToken)
 
-	// Find the matching download using the remote token
-	dl := c.downloads.getByRemoteToken(msg.Username, remoteToken)
-	if dl == nil {
-		fmt.Printf("[DEBUG] connectToPeerForTransfer: no matching download for username=%s, remoteToken=%d\n", msg.Username, remoteToken)
-		conn.Close()
-		return
-	}
-	fmt.Printf("[DEBUG] connectToPeerForTransfer: found matching download, handing off connection\n")
-
 	// NOTE: Do NOT send token back! The protocol does not expect a token echo.
 	// The next data the uploader expects is the 8-byte StartOffset from the downloader.
 
-	// Deliver connection to the download
-	select {
-	case dl.transferConnCh <- conn:
-		// Connection handed off successfully - don't close it
-		fmt.Printf("[DEBUG] connectToPeerForTransfer: connection handed off successfully\n")
-	default:
-		// Channel full or closed - download may have been cancelled
-		fmt.Printf("[DEBUG] connectToPeerForTransfer: channel full or closed\n")
-		conn.Close()
-	}
+	// Deliver connection to the transfer via TransferRegistry
+	c.deliverTransferConnection(msg.Username, remoteToken, conn)
 }
 
 // connectToPeer establishes a connection to a peer for receiving messages.

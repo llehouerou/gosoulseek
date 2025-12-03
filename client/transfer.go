@@ -2,11 +2,20 @@ package client
 
 import (
 	"fmt"
+	"io"
 	"sync"
 	"time"
 
+	"github.com/llehouerou/gosoulseek/connection"
 	"github.com/llehouerou/gosoulseek/messages/peer"
 )
+
+// TransferReadyInfo contains info from TransferRequest(Upload) message.
+// This is sent by the peer when they're ready to upload a file we requested.
+type TransferReadyInfo struct {
+	RemoteToken uint32
+	FileSize    int64
+}
 
 const (
 	// progressUpdateInterval is the minimum time between EMA speed updates.
@@ -50,6 +59,13 @@ type Transfer struct {
 
 	// Progress channel for external consumers
 	progressCh chan TransferProgress
+
+	// Coordination channels for downloads (initialized via InitDownloadChannels)
+	transferReadyCh chan TransferReadyInfo // TransferRequest(Upload) signal
+	transferConnCh  chan *connection.Conn  // F-type connection delivery
+
+	// Writer for download destination (set by DownloadV2)
+	writer io.Writer
 
 	mu sync.RWMutex
 }
@@ -251,4 +267,29 @@ func (t *Transfer) emitProgress() {
 // Close closes the progress channel.
 func (t *Transfer) Close() {
 	close(t.progressCh)
+}
+
+// InitDownloadChannels initializes the coordination channels for downloads.
+// This must be called before using TransferReadyCh or TransferConnCh.
+func (t *Transfer) InitDownloadChannels() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.transferReadyCh = make(chan TransferReadyInfo, 1)
+	t.transferConnCh = make(chan *connection.Conn, 1)
+}
+
+// TransferReadyCh returns the channel that receives TransferRequest(Upload) signals.
+// Returns nil if InitDownloadChannels hasn't been called.
+func (t *Transfer) TransferReadyCh() chan TransferReadyInfo {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.transferReadyCh
+}
+
+// TransferConnCh returns the channel that receives transfer connections.
+// Returns nil if InitDownloadChannels hasn't been called.
+func (t *Transfer) TransferConnCh() chan *connection.Conn {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.transferConnCh
 }

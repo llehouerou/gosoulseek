@@ -435,7 +435,7 @@ func TestPeerConnManager_GetOrCreate_DirectWinsRace(t *testing.T) {
 		conn:          connection.NewConn(clientConn),
 		peerSolicits:  newPendingPeerSolicits(),
 		solicitations: newPendingSolicitations(),
-		downloads:     newDownloadRegistry(),
+		transfers:     NewTransferRegistry(),
 	}
 	client.listener = newListener(client)
 
@@ -479,7 +479,7 @@ func TestPeerConnManager_GetOrCreate_IndirectWinsWhenDirectFails(t *testing.T) {
 		connected:     true, // Mark as connected so WriteMessage works
 		peerSolicits:  newPendingPeerSolicits(),
 		solicitations: newPendingSolicitations(),
-		downloads:     newDownloadRegistry(),
+		transfers:     NewTransferRegistry(),
 	}
 	client.listener = newListener(client)
 

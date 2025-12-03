@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/binary"
 	"net"
-	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -127,7 +126,7 @@ func TestListenerStartStop(t *testing.T) {
 	client := &Client{
 		peerSolicits:  newPendingPeerSolicits(),
 		solicitations: newPendingSolicitations(),
-		downloads:     newDownloadRegistry(),
+		transfers:     NewTransferRegistry(),
 	}
 	listener := newListener(client)
 
@@ -150,7 +149,7 @@ func TestListenerDoubleStart(t *testing.T) {
 	client := &Client{
 		peerSolicits:  newPendingPeerSolicits(),
 		solicitations: newPendingSolicitations(),
-		downloads:     newDownloadRegistry(),
+		transfers:     NewTransferRegistry(),
 	}
 	listener := newListener(client)
 
@@ -167,7 +166,7 @@ func TestListenerAcceptsConnection(t *testing.T) {
 	client := &Client{
 		peerSolicits:  newPendingPeerSolicits(),
 		solicitations: newPendingSolicitations(),
-		downloads:     newDownloadRegistry(),
+		transfers:     NewTransferRegistry(),
 	}
 	listener := newListener(client)
 
@@ -204,7 +203,7 @@ func TestPierceFirewallRouting(t *testing.T) {
 	client := &Client{
 		peerSolicits:  newPendingPeerSolicits(),
 		solicitations: newPendingSolicitations(),
-		downloads:     newDownloadRegistry(),
+		transfers:     NewTransferRegistry(),
 	}
 	listener := newListener(client)
 
@@ -247,7 +246,7 @@ func TestPeerInitPTypeRouting(t *testing.T) {
 	client := &Client{
 		peerSolicits:  newPendingPeerSolicits(),
 		solicitations: newPendingSolicitations(),
-		downloads:     newDownloadRegistry(),
+		transfers:     NewTransferRegistry(),
 	}
 	client.peerConnMgr = newPeerConnManager(client)
 	listener := newListener(client)
@@ -284,7 +283,7 @@ func TestPeerInitFTypeRouting(t *testing.T) {
 	client := &Client{
 		peerSolicits:  newPendingPeerSolicits(),
 		solicitations: newPendingSolicitations(),
-		downloads:     newDownloadRegistry(),
+		transfers:     NewTransferRegistry(),
 	}
 	listener := newListener(client)
 
@@ -295,20 +294,17 @@ func TestPeerInitFTypeRouting(t *testing.T) {
 	remoteToken := uint32(67890)
 	username := "uploader"
 
-	// Create a pending download that expects this transfer
-	dl := &activeDownload{
-		transferConnCh: make(chan *connection.Conn, 1),
-	}
+	// Create a pending download transfer
+	transfer, err := client.transfers.RegisterDownload(username, "@@music/file.mp3", 12345)
+	require.NoError(t, err)
+	transfer.InitDownloadChannels()
 
-	// Register using the same key format as getByRemoteToken (username/token)
-	client.downloads.mu.Lock()
-	key := username + "/" + strconv.FormatUint(uint64(remoteToken), 10)
-	client.downloads.byRemoteToken[key] = dl
-	client.downloads.mu.Unlock()
+	// Set the remote token so it can be looked up
+	_ = client.transfers.SetRemoteToken(transfer.Token, remoteToken)
 
 	// Connect and send PeerInit F-type + remote token
-	conn, err := net.Dial("tcp", listener.listener.Addr().String())
-	require.NoError(t, err)
+	conn, dialErr := net.Dial("tcp", listener.listener.Addr().String())
+	require.NoError(t, dialErr)
 	defer conn.Close()
 
 	wrappedConn := connection.NewConn(conn)
@@ -328,9 +324,9 @@ func TestPeerInitFTypeRouting(t *testing.T) {
 	_, err = wrappedConn.Write(tokenBuf[:])
 	require.NoError(t, err)
 
-	// Should receive connection on download channel
+	// Should receive connection on transfer channel
 	select {
-	case received := <-dl.transferConnCh:
+	case received := <-transfer.TransferConnCh():
 		require.NotNil(t, received)
 	case <-time.After(time.Second):
 		t.Fatal("timeout waiting for transfer connection delivery")
@@ -342,7 +338,7 @@ func TestUnknownTokenRejection(t *testing.T) {
 	client := &Client{
 		peerSolicits:  newPendingPeerSolicits(),
 		solicitations: newPendingSolicitations(),
-		downloads:     newDownloadRegistry(),
+		transfers:     NewTransferRegistry(),
 	}
 	listener := newListener(client)
 
@@ -376,7 +372,7 @@ func TestConcurrentConnections(t *testing.T) {
 	client := &Client{
 		peerSolicits:  newPendingPeerSolicits(),
 		solicitations: newPendingSolicitations(),
-		downloads:     newDownloadRegistry(),
+		transfers:     NewTransferRegistry(),
 	}
 	listener := newListener(client)
 
@@ -437,7 +433,7 @@ func TestPeerSolicitRouting(t *testing.T) {
 	client := &Client{
 		peerSolicits:  newPendingPeerSolicits(),
 		solicitations: newPendingSolicitations(),
-		downloads:     newDownloadRegistry(),
+		transfers:     NewTransferRegistry(),
 	}
 	client.peerConnMgr = newPeerConnManager(client)
 	listener := newListener(client)
@@ -480,7 +476,7 @@ func TestDTypeRejection(t *testing.T) {
 	client := &Client{
 		peerSolicits:  newPendingPeerSolicits(),
 		solicitations: newPendingSolicitations(),
-		downloads:     newDownloadRegistry(),
+		transfers:     NewTransferRegistry(),
 	}
 	listener := newListener(client)
 
@@ -515,7 +511,7 @@ func TestPeerConnCaching(t *testing.T) {
 	client := &Client{
 		peerSolicits:  newPendingPeerSolicits(),
 		solicitations: newPendingSolicitations(),
-		downloads:     newDownloadRegistry(),
+		transfers:     NewTransferRegistry(),
 	}
 	client.peerConnMgr = newPeerConnManager(client)
 

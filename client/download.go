@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -21,140 +20,43 @@ import (
 // transferToken is an atomic counter for generating unique transfer tokens.
 var transferToken uint32
 
-// DownloadProgress represents the current state and progress of a download.
-type DownloadProgress struct {
-	State            TransferState
-	BytesTransferred int64
-	FileSize         int64
-	QueuePosition    uint32 // Position in remote queue (0 if not queued)
-	Error            error  // Set when State is Failed
-}
-
-// PercentComplete returns the download progress as a percentage.
-func (p *DownloadProgress) PercentComplete() float64 {
-	if p.FileSize == 0 {
-		return 0
+// getPeerAddress requests a peer's IP address and port from the server.
+func (c *Client) getPeerAddress(ctx context.Context, username string) (string, error) {
+	var buf bytes.Buffer
+	w := protocol.NewWriter(&buf)
+	(&server.GetPeerAddress{Username: username}).Encode(w)
+	if err := w.Error(); err != nil {
+		return "", fmt.Errorf("encode: %w", err)
 	}
-	return float64(p.BytesTransferred) / float64(p.FileSize) * 100
-}
 
-// transferReadyInfo contains info from TransferRequest(Upload) message.
-type transferReadyInfo struct {
-	remoteToken uint32
-	fileSize    int64
-}
-
-// activeDownload tracks an ongoing download.
-type activeDownload struct {
-	username string
-	filename string
-	token    uint32 // Our local token
-	fileSize int64
-
-	// Remote token - set when peer sends TransferRequest(Upload)
-	remoteToken    uint32
-	hasRemoteToken bool
-
-	// Progress channel - sends updates and closes on completion
-	progressCh chan DownloadProgress
-
-	// Transfer connection channel - receives the "F" type connection
-	transferConnCh chan *connection.Conn
-
-	// Transfer ready channel - signaled when TransferRequest(Upload) arrives on ANY connection
-	transferReadyCh chan transferReadyInfo
-
-	// Context for cancellation
-	ctx    context.Context
-	cancel context.CancelFunc
-
-	// Destination writer
-	writer io.Writer
-
-	// State tracking
-	mu    sync.Mutex
-	state TransferState
-}
-
-// downloadRegistry manages active downloads.
-type downloadRegistry struct {
-	mu            sync.RWMutex
-	downloads     map[uint32]*activeDownload // by our token
-	byFile        map[string]*activeDownload // by "username/filename"
-	byRemoteToken map[string]*activeDownload // by "username/remoteToken"
-}
-
-func newDownloadRegistry() *downloadRegistry {
-	return &downloadRegistry{
-		downloads:     make(map[uint32]*activeDownload),
-		byFile:        make(map[string]*activeDownload),
-		byRemoteToken: make(map[string]*activeDownload),
+	if err := c.WriteMessage(buf.Bytes()); err != nil {
+		return "", fmt.Errorf("send: %w", err)
 	}
-}
 
-func (r *downloadRegistry) add(dl *activeDownload) {
-	r.mu.Lock()
-	r.downloads[dl.token] = dl
-	r.byFile[dl.username+"/"+dl.filename] = dl
-	r.mu.Unlock()
-}
+	// Wait for response
+	respCh := make(chan *server.GetPeerAddressResponse, 1)
+	handlerID := c.router.Register(uint32(protocol.ServerGetPeerAddress), func(_ uint32, payload []byte) {
+		resp, err := server.DecodeGetPeerAddress(protocol.NewReader(bytes.NewReader(payload)))
+		if err != nil || resp.Username != username {
+			return
+		}
+		select {
+		case respCh <- resp:
+		default:
+		}
+	})
+	defer c.router.Unregister(uint32(protocol.ServerGetPeerAddress), handlerID)
 
-// setRemoteToken sets the remote token for a download and indexes it.
-func (r *downloadRegistry) setRemoteToken(dl *activeDownload, remoteToken uint32) {
-	r.mu.Lock()
-	dl.remoteToken = remoteToken
-	dl.hasRemoteToken = true
-	r.byRemoteToken[fmt.Sprintf("%s/%d", dl.username, remoteToken)] = dl
-	r.mu.Unlock()
-}
-
-// getByRemoteToken finds a download by username and remote token.
-func (r *downloadRegistry) getByRemoteToken(username string, remoteToken uint32) *activeDownload {
-	r.mu.RLock()
-	dl := r.byRemoteToken[fmt.Sprintf("%s/%d", username, remoteToken)]
-	r.mu.RUnlock()
-	return dl
-}
-
-// getByFile finds a download by username and filename.
-func (r *downloadRegistry) getByFile(username, filename string) *activeDownload {
-	r.mu.RLock()
-	dl := r.byFile[username+"/"+filename]
-	r.mu.RUnlock()
-	return dl
-}
-
-func (r *downloadRegistry) remove(dl *activeDownload) {
-	r.mu.Lock()
-	delete(r.downloads, dl.token)
-	delete(r.byFile, dl.username+"/"+dl.filename)
-	if dl.hasRemoteToken {
-		delete(r.byRemoteToken, fmt.Sprintf("%s/%d", dl.username, dl.remoteToken))
+	select {
+	case <-ctx.Done():
+		return "", ctx.Err()
+	case resp := <-respCh:
+		return fmt.Sprintf("%s:%d", resp.IPAddress, resp.Port), nil
 	}
-	r.mu.Unlock()
-}
-
-func (r *downloadRegistry) closeAll() {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	for _, dl := range r.downloads {
-		dl.cancel()
-		close(dl.progressCh)
-	}
-	r.downloads = make(map[uint32]*activeDownload)
-	r.byFile = make(map[string]*activeDownload)
-	r.byRemoteToken = make(map[string]*activeDownload)
 }
 
 // Download initiates a file download from a peer.
 // It returns a channel that receives progress updates and closes when the download completes.
-//
-// The download flow:
-// 1. Request the file from the peer (TransferRequest)
-// 2. Wait for acceptance or queue position
-// 3. Establish transfer connection when peer is ready
-// 4. Receive file data
 //
 // Example:
 //
@@ -163,12 +65,12 @@ func (r *downloadRegistry) closeAll() {
 //	    return err
 //	}
 //	for p := range progress {
-//	    fmt.Printf("%.1f%% complete\n", p.PercentComplete())
+//	    fmt.Printf("%.1f%% complete\n", float64(p.BytesTransferred)/float64(p.FileSize)*100)
 //	    if p.Error != nil {
 //	        return p.Error
 //	    }
 //	}
-func (c *Client) Download(ctx context.Context, username, filename string, w io.Writer) (<-chan DownloadProgress, error) {
+func (c *Client) Download(ctx context.Context, username, filename string, w io.Writer, opts ...DownloadOption) (<-chan TransferProgress, error) {
 	c.mu.Lock()
 	if !c.loggedIn {
 		c.mu.Unlock()
@@ -176,215 +78,145 @@ func (c *Client) Download(ctx context.Context, username, filename string, w io.W
 	}
 	c.mu.Unlock()
 
+	// Apply options
+	cfg := &downloadConfig{}
+	for _, opt := range opts {
+		opt(cfg)
+	}
+
 	// Generate unique token
 	token := atomic.AddUint32(&transferToken, 1)
 
-	// Create progress channel
-	progressCh := make(chan DownloadProgress, 100)
-
-	// Create transfer connection channel (receives the "F" connection)
-	transferConnCh := make(chan *connection.Conn, 1)
-
-	// Create transfer ready channel (signaled when TransferRequest(Upload) arrives)
-	transferReadyCh := make(chan transferReadyInfo, 1)
-
-	// Create cancellable context
-	dlCtx, cancel := context.WithCancel(ctx)
-
-	dl := &activeDownload{
-		username:        username,
-		filename:        filename,
-		token:           token,
-		progressCh:      progressCh,
-		transferConnCh:  transferConnCh,
-		transferReadyCh: transferReadyCh,
-		ctx:             dlCtx,
-		cancel:          cancel,
-		writer:          w,
-		state:           TransferStateQueued | TransferStateLocally,
-	}
-
-	// Register the download
-	c.downloads.add(dl)
-
-	// Start the download process in a goroutine
-	go c.runDownload(dl)
-
-	return progressCh, nil
-}
-
-// runDownload handles the download flow.
-func (c *Client) runDownload(dl *activeDownload) {
-	defer func() {
-		c.downloads.remove(dl)
-		close(dl.progressCh)
-	}()
-
-	// Send initial progress
-	dl.sendProgress(TransferStateQueued|TransferStateLocally, 0, 0, 0, nil)
-
-	// Step 1: Get peer address from server
-	peerAddr, err := c.getPeerAddress(dl.ctx, dl.username)
-	if err != nil {
-		dl.sendProgress(TransferStateCompleted|TransferStateErrored, 0, 0, 0, fmt.Errorf("get peer address: %w", err))
-		return
-	}
-
-	// Step 2: Connect to peer and send transfer request
-	dl.sendProgress(TransferStateRequested, 0, 0, 0, nil)
-
-	peerConn, err := c.connectToPeerForDownload(dl.ctx, peerAddr, dl)
-	if err != nil {
-		dl.sendProgress(TransferStateCompleted|TransferStateErrored, 0, 0, 0, fmt.Errorf("connect to peer: %w", err))
-		return
-	}
-	defer peerConn.Close()
-
-	// Step 3: Send TransferRequest
-	if err := c.sendTransferRequest(peerConn, dl); err != nil {
-		dl.sendProgress(TransferStateCompleted|TransferStateErrored, 0, 0, 0, fmt.Errorf("send transfer request: %w", err))
-		return
-	}
-
-	// Step 4: Wait for response
-	resp, err := c.waitForTransferResponse(dl.ctx, peerConn, dl.token)
-	if err != nil {
-		dl.sendProgress(TransferStateCompleted|TransferStateErrored, 0, 0, 0, fmt.Errorf("wait for response: %w", err))
-		return
-	}
-
-	if err := c.handleTransferResponse(resp, peerAddr, peerConn, dl); err != nil {
-		dl.sendProgress(TransferStateCompleted|TransferStateErrored, dl.fileSize, 0, 0, err)
-		return
-	}
-
-	dl.sendProgress(TransferStateCompleted|TransferStateSucceeded, dl.fileSize, dl.fileSize, 0, nil)
-}
-
-// handleTransferResponse processes the peer's transfer response.
-func (c *Client) handleTransferResponse(resp *peer.TransferResponse, peerAddr string, peerConn *connection.Conn, dl *activeDownload) error {
-	if resp.Allowed {
-		// Immediate transfer
-		dl.fileSize = resp.FileSize
-		return c.performTransfer(dl.ctx, peerAddr, dl)
-	}
-
-	if resp.Reason != "Queued" {
-		return fmt.Errorf("transfer denied: %s", resp.Reason)
-	}
-
-	// File is queued - wait for peer to initiate transfer
-	dl.sendProgress(TransferStateQueued|TransferStateRemotely, 0, 0, 0, nil)
-	return c.waitForPeerTransfer(dl.ctx, peerAddr, peerConn, dl)
-}
-
-// sendProgress sends a progress update to the channel (non-blocking).
-func (dl *activeDownload) sendProgress(state TransferState, fileSize, transferred int64, queuePos uint32, err error) {
-	dl.mu.Lock()
-	dl.state = state
-	dl.mu.Unlock()
-
-	progress := DownloadProgress{
-		State:            state,
-		FileSize:         fileSize,
-		BytesTransferred: transferred,
-		QueuePosition:    queuePos,
-		Error:            err,
-	}
-
-	select {
-	case dl.progressCh <- progress:
-	default:
-		// Channel full, skip update
-	}
-}
-
-// getPeerAddress requests the peer's address from the server.
-func (c *Client) getPeerAddress(ctx context.Context, username string) (string, error) {
-	// Create a channel to receive the response
-	type addrResult struct {
-		addr string
-		err  error
-	}
-	resultCh := make(chan addrResult, 1)
-
-	// Register temporary handler for GetPeerAddress response
-	handlerID := c.router.Register(uint32(protocol.ServerGetPeerAddress), func(_ uint32, payload []byte) {
-		resp, err := server.DecodeGetPeerAddress(protocol.NewReader(bytes.NewReader(payload)))
-		if err != nil {
-			return
-		}
-		if resp.Username == username {
-			select {
-			case resultCh <- addrResult{addr: fmt.Sprintf("%s:%d", resp.IPAddress, resp.Port)}:
-			default:
-			}
-		}
-	})
-	defer c.router.Unregister(uint32(protocol.ServerGetPeerAddress), handlerID)
-
-	// Send request
-	var buf bytes.Buffer
-	w := protocol.NewWriter(&buf)
-	req := &server.GetPeerAddress{Username: username}
-	req.Encode(w)
-	if err := w.Error(); err != nil {
-		return "", err
-	}
-	if err := c.WriteMessage(buf.Bytes()); err != nil {
-		return "", err
-	}
-
-	// Wait for response
-	select {
-	case <-ctx.Done():
-		return "", ctx.Err()
-	case result := <-resultCh:
-		return result.addr, result.err
-	}
-}
-
-// connectToPeerForDownload establishes a peer connection for downloading.
-// Uses the connection manager for caching and parallel direct+indirect strategy.
-func (c *Client) connectToPeerForDownload(ctx context.Context, addr string, dl *activeDownload) (*connection.Conn, error) {
-	// Use the connection manager which handles:
-	// - Connection caching per username
-	// - Parallel direct+indirect strategy
-	// - Connection deduplication for concurrent requests
-	conn, isNew, err := c.peerConnMgr.GetOrCreateEx(ctx, dl.username, addr)
+	// Register with TransferRegistry (duplicate detection happens here)
+	transfer, err := c.transfers.RegisterDownload(username, filename, token)
 	if err != nil {
 		return nil, err
 	}
 
-	// Start message handler only if we created a new connection
+	// Initialize transfer fields
+	transfer.StartOffset = cfg.startOffset
+	transfer.InitDownloadChannels()
+
+	// Store writer in transfer (need to add this field)
+	transfer.mu.Lock()
+	transfer.writer = w
+	transfer.mu.Unlock()
+
+	// Create cancellable context
+	dlCtx, cancel := context.WithCancel(ctx)
+
+	// Create and start orchestrator
+	orch := &downloadOrchestrator{
+		client:   c,
+		transfer: transfer,
+		ctx:      dlCtx,
+		cancel:   cancel,
+	}
+	go orch.run()
+
+	return transfer.Progress(), nil
+}
+
+// downloadOrchestrator handles a single download using the new infrastructure.
+type downloadOrchestrator struct {
+	client   *Client
+	transfer *Transfer
+	peerAddr string
+	ctx      context.Context
+	cancel   context.CancelFunc
+}
+
+// run executes the download flow.
+func (o *downloadOrchestrator) run() {
+	defer o.cleanup()
+
+	// Send initial progress
+	o.transfer.SetState(TransferStateQueued | TransferStateLocally)
+	o.transfer.emitProgress()
+
+	// Phase 1: Get peer address
+	if err := o.getPeerAddress(); err != nil {
+		o.fail(fmt.Errorf("get peer address: %w", err))
+		return
+	}
+
+	// Phase 2: Connect to peer and send transfer request
+	o.transfer.SetState(TransferStateRequested)
+	o.transfer.emitProgress()
+
+	peerConn, err := o.connectToPeer()
+	if err != nil {
+		o.fail(fmt.Errorf("connect to peer: %w", err))
+		return
+	}
+	defer peerConn.Close()
+
+	// Phase 3: Send TransferRequest
+	if err := o.sendTransferRequest(peerConn); err != nil {
+		o.fail(fmt.Errorf("send transfer request: %w", err))
+		return
+	}
+
+	// Phase 4: Wait for response
+	resp, err := o.waitForTransferResponse(peerConn)
+	if err != nil {
+		o.fail(fmt.Errorf("wait for response: %w", err))
+		return
+	}
+
+	// Phase 5: Handle response (immediate or queued)
+	if err := o.handleTransferResponse(resp, peerConn); err != nil {
+		o.fail(err)
+		return
+	}
+
+	// Success
+	o.complete()
+}
+
+// getPeerAddress requests the peer's address from the server.
+func (o *downloadOrchestrator) getPeerAddress() error {
+	addr, err := o.client.getPeerAddress(o.ctx, o.transfer.Username)
+	if err != nil {
+		return err
+	}
+	o.peerAddr = addr
+	return nil
+}
+
+// connectToPeer establishes a P-type message connection to the peer.
+func (o *downloadOrchestrator) connectToPeer() (*connection.Conn, error) {
+	conn, isNew, err := o.client.peerConnMgr.GetOrCreateEx(o.ctx, o.transfer.Username, o.peerAddr)
+	if err != nil {
+		return nil, err
+	}
+
 	if isNew {
-		go c.handleIncomingPeerMessages(conn, dl.username)
+		go o.client.handleIncomingPeerMessages(conn, o.transfer.Username)
 	}
 
 	return conn, nil
 }
 
 // sendTransferRequest sends a download request to the peer.
-func (c *Client) sendTransferRequest(conn *connection.Conn, dl *activeDownload) error {
+func (o *downloadOrchestrator) sendTransferRequest(conn *connection.Conn) error {
 	var buf bytes.Buffer
 	w := protocol.NewWriter(&buf)
 	req := &peer.TransferRequest{
 		Direction: peer.TransferDownload,
-		Token:     dl.token,
-		Filename:  dl.filename,
+		Token:     o.transfer.Token,
+		Filename:  o.transfer.Filename,
 	}
 	req.Encode(w)
 	if err := w.Error(); err != nil {
 		return err
 	}
-
 	return conn.WriteMessage(buf.Bytes())
 }
 
-// waitForTransferResponse waits for the peer's response to our transfer request.
-func (c *Client) waitForTransferResponse(ctx context.Context, conn *connection.Conn, token uint32) (*peer.TransferResponse, error) {
-	// Set read deadline based on context
-	deadline, ok := ctx.Deadline()
+// waitForTransferResponse waits for the peer's response.
+func (o *downloadOrchestrator) waitForTransferResponse(conn *connection.Conn) (*peer.TransferResponse, error) {
+	deadline, ok := o.ctx.Deadline()
 	if ok {
 		if err := conn.SetReadDeadline(deadline); err != nil {
 			return nil, err
@@ -397,8 +229,8 @@ func (c *Client) waitForTransferResponse(ctx context.Context, conn *connection.C
 
 	for {
 		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
+		case <-o.ctx.Done():
+			return nil, o.ctx.Err()
 		default:
 		}
 
@@ -412,75 +244,130 @@ func (c *Client) waitForTransferResponse(ctx context.Context, conn *connection.C
 		}
 
 		code := binary.LittleEndian.Uint32(payload[:4])
-
 		if code == uint32(protocol.PeerTransferResponse) {
 			resp, err := peer.DecodeTransferResponse(payload)
 			if err != nil {
 				return nil, err
 			}
-			if resp.Token == token {
+			if resp.Token == o.transfer.Token {
 				return resp, nil
 			}
 		}
 	}
 }
 
-// waitForPeerTransfer waits for the peer to initiate the transfer (when queued).
-// The peer will send TransferRequest(Upload) with their token (remoteToken),
-// then connect to us (or we receive a ConnectToPeer) with an "F" type connection.
-//
-// IMPORTANT: TransferRequest(Upload) can arrive on ANY message connection from the peer,
-// not just the one we established. We use a channel-based approach to handle this.
-func (c *Client) waitForPeerTransfer(ctx context.Context, peerAddr string, conn *connection.Conn, dl *activeDownload) error {
-	log.Printf("[DEBUG] waitForPeerTransfer: starting, waiting for TransferRequest(Upload) from %s", dl.username)
+// handleTransferResponse processes the peer's response and performs the transfer.
+func (o *downloadOrchestrator) handleTransferResponse(resp *peer.TransferResponse, peerConn *connection.Conn) error {
+	if resp.Allowed {
+		// Immediate transfer
+		o.transfer.mu.Lock()
+		o.transfer.Size = resp.FileSize
+		o.transfer.mu.Unlock()
+		return o.performImmediateTransfer()
+	}
 
-	// Start a goroutine to read messages from the connection we established.
-	// This handles messages like PlaceInQueue, UploadDenied, UploadFailed.
-	// TransferRequest(Upload) might also arrive here, but it could arrive on a different connection too.
+	if resp.Reason != "Queued" {
+		return &TransferRejectedError{Reason: resp.Reason}
+	}
+
+	// File is queued - wait for peer to initiate transfer
+	o.transfer.SetState(TransferStateQueued | TransferStateRemotely)
+	o.transfer.emitProgress()
+
+	return o.waitForQueuedTransfer(peerConn)
+}
+
+// performImmediateTransfer handles immediate transfers where the peer is ready to send.
+func (o *downloadOrchestrator) performImmediateTransfer() error {
+	o.transfer.SetState(TransferStateInitializing)
+	o.transfer.emitProgress()
+
+	log.Printf("[DEBUG] performImmediateTransfer: connecting to %s with token=%d", o.peerAddr, o.transfer.Token)
+
+	// Establish transfer connection
+	dialCtx, cancel := context.WithTimeout(o.ctx, 30*time.Second)
+	defer cancel()
+
+	conn, err := connection.Dial(dialCtx, o.peerAddr)
+	if err != nil {
+		return fmt.Errorf("dial: %w", err)
+	}
+	defer conn.Close()
+
+	// Send PeerInit with F-type and our token
+	o.client.mu.Lock()
+	username := o.client.username
+	o.client.mu.Unlock()
+
+	var buf bytes.Buffer
+	w := protocol.NewWriter(&buf)
+	init := &peer.Init{
+		Username: username,
+		Type:     "F",
+		Token:    o.transfer.Token,
+	}
+	init.Encode(w)
+	if err := w.Error(); err != nil {
+		return err
+	}
+	if err := conn.WriteMessage(buf.Bytes()); err != nil {
+		return fmt.Errorf("send init: %w", err)
+	}
+
+	// Send token as 4 raw bytes
+	var tokenBuf [4]byte
+	binary.LittleEndian.PutUint32(tokenBuf[:], o.transfer.Token)
+	if _, err := conn.Write(tokenBuf[:]); err != nil {
+		return fmt.Errorf("send token: %w", err)
+	}
+
+	return o.transferData(conn)
+}
+
+// waitForQueuedTransfer waits for the peer to initiate the transfer.
+func (o *downloadOrchestrator) waitForQueuedTransfer(peerConn *connection.Conn) error {
+	log.Printf("[DEBUG] waitForQueuedTransfer: waiting for TransferRequest(Upload) from %s", o.transfer.Username)
+
+	// Start reading messages from the P-type connection
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- c.readPeerMessagesUntilReady(conn, dl)
+		errCh <- o.readPeerMessagesUntilReady(peerConn)
 	}()
 
-	// Wait for either:
-	// 1. TransferRequest(Upload) signal via transferReadyCh (from ANY connection)
-	// 2. Error from reading the connection we established
-	// 3. Context cancellation
+	// Wait for signal or error
 	select {
-	case <-ctx.Done():
-		return ctx.Err()
+	case <-o.ctx.Done():
+		return o.ctx.Err()
 
 	case err := <-errCh:
-		// Connection read returned - either error or we got TransferRequest on this connection
 		if err != nil {
-			// Check if we got signaled via channel in the meantime
+			// Check if we got signaled via channel
 			select {
-			case info := <-dl.transferReadyCh:
-				log.Printf("[DEBUG] waitForPeerTransfer: got signal despite error, remoteToken=%d", info.remoteToken)
-				dl.fileSize = info.fileSize
-				dl.sendProgress(TransferStateInitializing, dl.fileSize, 0, 0, nil)
-				return c.waitForTransferConnection(ctx, peerAddr, dl)
+			case info := <-o.transfer.TransferReadyCh():
+				o.transfer.mu.Lock()
+				o.transfer.Size = info.FileSize
+				o.transfer.RemoteToken = info.RemoteToken
+				o.transfer.mu.Unlock()
+				_ = o.client.transfers.SetRemoteToken(o.transfer.Token, info.RemoteToken)
+				return o.waitForTransferConnection()
 			default:
 				return err
 			}
 		}
-		// No error means we got TransferRequest on this connection and it was handled
-		dl.sendProgress(TransferStateInitializing, dl.fileSize, 0, 0, nil)
-		return c.waitForTransferConnection(ctx, peerAddr, dl)
+		return o.waitForTransferConnection()
 
-	case info := <-dl.transferReadyCh:
-		// TransferRequest(Upload) arrived on some connection (maybe this one, maybe another)
-		log.Printf("[DEBUG] waitForPeerTransfer: got transferReadyCh signal, remoteToken=%d, fileSize=%d", info.remoteToken, info.fileSize)
-		dl.fileSize = info.fileSize
-		dl.sendProgress(TransferStateInitializing, dl.fileSize, 0, 0, nil)
-		return c.waitForTransferConnection(ctx, peerAddr, dl)
+	case info := <-o.transfer.TransferReadyCh():
+		o.transfer.mu.Lock()
+		o.transfer.Size = info.FileSize
+		o.transfer.RemoteToken = info.RemoteToken
+		o.transfer.mu.Unlock()
+		_ = o.client.transfers.SetRemoteToken(o.transfer.Token, info.RemoteToken)
+		return o.waitForTransferConnection()
 	}
 }
 
 // readPeerMessagesUntilReady reads messages from the P-type connection.
-// Returns nil when TransferRequest(Upload) is received, or error on failure.
-func (c *Client) readPeerMessagesUntilReady(conn *connection.Conn, dl *activeDownload) error {
-	// Set a longer deadline for queued downloads
+func (o *downloadOrchestrator) readPeerMessagesUntilReady(conn *connection.Conn) error {
 	if err := conn.SetReadDeadline(time.Now().Add(10 * time.Minute)); err != nil {
 		return err
 	}
@@ -499,7 +386,6 @@ func (c *Client) readPeerMessagesUntilReady(conn *connection.Conn, dl *activeDow
 
 		switch code {
 		case uint32(protocol.PeerTransferRequest):
-			// Peer is ready to send - handle it via the global handler
 			req, err := peer.DecodeTransferRequest(payload)
 			if err != nil {
 				continue
@@ -507,16 +393,18 @@ func (c *Client) readPeerMessagesUntilReady(conn *connection.Conn, dl *activeDow
 			log.Printf("[DEBUG] readPeerMessagesUntilReady: got TransferRequest direction=%d, filename=%s, token=%d",
 				req.Direction, req.Filename, req.Token)
 
-			// Must be Upload direction and match our filename
-			if req.Direction != peer.TransferUpload || req.Filename != dl.filename {
+			if req.Direction != peer.TransferUpload || req.Filename != o.transfer.Filename {
 				continue
 			}
 
-			// Store the remote token
-			c.downloads.setRemoteToken(dl, req.Token)
-			dl.fileSize = req.FileSize
+			// Store remote token
+			o.transfer.mu.Lock()
+			o.transfer.RemoteToken = req.Token
+			o.transfer.Size = req.FileSize
+			o.transfer.mu.Unlock()
+			_ = o.client.transfers.SetRemoteToken(o.transfer.Token, req.Token)
 
-			// Send TransferResponse accepting the transfer
+			// Send TransferResponse
 			var buf bytes.Buffer
 			w := protocol.NewWriter(&buf)
 			resp := &peer.TransferResponse{
@@ -528,26 +416,26 @@ func (c *Client) readPeerMessagesUntilReady(conn *connection.Conn, dl *activeDow
 			if err := w.Error(); err != nil {
 				return err
 			}
-			log.Printf("[DEBUG] readPeerMessagesUntilReady: sending TransferResponse Allowed=true for token=%d", req.Token)
 			if err := conn.WriteMessage(buf.Bytes()); err != nil {
 				return err
 			}
 
-			// Signal via channel (in case waitForPeerTransfer is waiting on it)
+			// Signal via channel
 			select {
-			case dl.transferReadyCh <- transferReadyInfo{remoteToken: req.Token, fileSize: req.FileSize}:
+			case o.transfer.TransferReadyCh() <- TransferReadyInfo{RemoteToken: req.Token, FileSize: req.FileSize}:
 			default:
 			}
 
-			return nil // Success - ready for transfer
+			return nil
 
 		case uint32(protocol.PeerPlaceInQueueResponse):
 			resp, err := peer.DecodePlaceInQueueResponse(payload)
 			if err != nil {
 				continue
 			}
-			if resp.Filename == dl.filename {
-				dl.sendProgress(TransferStateQueued|TransferStateRemotely, 0, 0, resp.Place, nil)
+			if resp.Filename == o.transfer.Filename {
+				// Update queue position in progress
+				o.transfer.emitProgress()
 			}
 
 		case uint32(protocol.PeerUploadDenied):
@@ -555,8 +443,8 @@ func (c *Client) readPeerMessagesUntilReady(conn *connection.Conn, dl *activeDow
 			if err != nil {
 				continue
 			}
-			if denied.Filename == dl.filename {
-				return fmt.Errorf("upload denied: %s", denied.Reason)
+			if denied.Filename == o.transfer.Filename {
+				return &TransferRejectedError{Reason: denied.Reason}
 			}
 
 		case uint32(protocol.PeerUploadFailed):
@@ -564,256 +452,129 @@ func (c *Client) readPeerMessagesUntilReady(conn *connection.Conn, dl *activeDow
 			if err != nil {
 				continue
 			}
-			if failed.Filename == dl.filename {
+			if failed.Filename == o.transfer.Filename {
 				return errors.New("upload failed")
 			}
 		}
 	}
 }
 
-// waitForTransferConnection gets the "F" type transfer connection.
-// This uses a dual strategy - trying both simultaneously:
-// 1. Waiting for peer to connect to our listener (inbound)
-// 2. Connecting directly to the peer (outbound)
-// The first successful connection wins.
-func (c *Client) waitForTransferConnection(ctx context.Context, peerAddr string, dl *activeDownload) error {
-	log.Printf("[DEBUG] waitForTransferConnection: starting, peerAddr=%s, remoteToken=%d", peerAddr, dl.remoteToken)
-	conn, err := c.getTransferConnection(ctx, peerAddr, dl)
+// waitForTransferConnection gets the F-type transfer connection using triple strategy.
+func (o *downloadOrchestrator) waitForTransferConnection() error {
+	o.transfer.SetState(TransferStateInitializing)
+	o.transfer.emitProgress()
+
+	log.Printf("[DEBUG] waitForTransferConnection: starting triple strategy, peerAddr=%s, remoteToken=%d",
+		o.peerAddr, o.transfer.RemoteToken)
+
+	conn, err := o.getTransferConnection()
 	if err != nil {
-		log.Printf("[DEBUG] waitForTransferConnection: getTransferConnection failed: %v", err)
 		return err
 	}
 	defer conn.Close()
-	log.Printf("[DEBUG] waitForTransferConnection: got connection, sending offset")
 
-	// Send 8-byte offset (0 for full file)
-	var offsetBuf [8]byte
-	if _, err := conn.Write(offsetBuf[:]); err != nil {
-		log.Printf("[DEBUG] waitForTransferConnection: send offset failed: %v", err)
-		return fmt.Errorf("send offset: %w", err)
-	}
-	log.Printf("[DEBUG] waitForTransferConnection: offset sent, receiving file data")
-
-	// Receive file data
-	dl.sendProgress(TransferStateInProgress, dl.fileSize, 0, 0, nil)
-	return c.receiveFileData(ctx, conn, dl)
+	return o.transferData(conn)
 }
 
-// getTransferConnection gets a transfer connection using triple strategy.
-// It tries three methods simultaneously:
-// 1. Wait for peer to connect to us directly (inbound)
-// 2. Connect directly to peer (outbound)
-// 3. Ask server to tell peer to connect to us (indirect/solicited)
-func (c *Client) getTransferConnection(ctx context.Context, peerAddr string, dl *activeDownload) (*connection.Conn, error) {
-	log.Printf("[DEBUG] getTransferConnection: starting triple strategy for peerAddr=%s", peerAddr)
-	type connResult struct {
+// getTransferConnection uses triple strategy to get a transfer connection.
+func (o *downloadOrchestrator) getTransferConnection() (*connection.Conn, error) {
+	type result struct {
 		conn   *connection.Conn
 		method string
 		err    error
 	}
-	resultCh := make(chan connResult, 3)
+	resultCh := make(chan result, 3)
 
-	// Create cancellation contexts for each method
-	inboundCtx, cancelInbound := context.WithCancel(ctx)
-	defer cancelInbound()
-	outboundCtx, cancelOutbound := context.WithCancel(ctx)
-	defer cancelOutbound()
-	indirectCtx, cancelIndirect := context.WithCancel(ctx)
-	defer cancelIndirect()
+	ctx1, cancel1 := context.WithCancel(o.ctx)
+	ctx2, cancel2 := context.WithCancel(o.ctx)
+	ctx3, cancel3 := context.WithCancel(o.ctx)
+	defer cancel1()
+	defer cancel2()
+	defer cancel3()
 
-	// Method 1: Wait for peer to connect to us (inbound)
+	// Method 1: Wait for inbound connection
 	go func() {
-		log.Printf("[DEBUG] getTransferConnection: starting inbound wait")
-		conn, err := c.waitForInboundTransferConnection(inboundCtx, dl)
-		log.Printf("[DEBUG] getTransferConnection: inbound result: conn=%v, err=%v", conn != nil, err)
+		conn, err := o.waitInboundConnection(ctx1)
 		select {
-		case resultCh <- connResult{conn: conn, method: "inbound", err: err}:
-		case <-inboundCtx.Done():
+		case resultCh <- result{conn, "inbound", err}:
+		case <-ctx1.Done():
 			if conn != nil {
 				conn.Close()
 			}
 		}
 	}()
 
-	// Method 2: Connect directly to peer (outbound)
+	// Method 2: Connect directly to peer
 	go func() {
-		log.Printf("[DEBUG] getTransferConnection: starting outbound connect to %s", peerAddr)
-		conn, err := c.connectTransferDirect(outboundCtx, peerAddr, dl)
-		log.Printf("[DEBUG] getTransferConnection: outbound result: conn=%v, err=%v", conn != nil, err)
+		conn, err := o.connectDirectTransfer(ctx2)
 		select {
-		case resultCh <- connResult{conn: conn, method: "outbound", err: err}:
-		case <-outboundCtx.Done():
+		case resultCh <- result{conn, "direct", err}:
+		case <-ctx2.Done():
 			if conn != nil {
 				conn.Close()
 			}
 		}
 	}()
 
-	// Method 3: Ask server to tell peer to connect to us (indirect)
+	// Method 3: Solicited connection via server
 	go func() {
-		log.Printf("[DEBUG] getTransferConnection: starting indirect solicitation")
-		conn, err := c.solicitTransferConnection(indirectCtx, dl)
-		log.Printf("[DEBUG] getTransferConnection: indirect result: conn=%v, err=%v", conn != nil, err)
+		conn, err := o.solicitTransferConnection(ctx3)
 		select {
-		case resultCh <- connResult{conn: conn, method: "indirect", err: err}:
-		case <-indirectCtx.Done():
+		case resultCh <- result{conn, "indirect", err}:
+		case <-ctx3.Done():
 			if conn != nil {
 				conn.Close()
 			}
 		}
 	}()
 
-	// Wait for first successful connection
-	var inboundErr, outboundErr, indirectErr error
+	var errs []error
 	for range 3 {
 		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case result := <-resultCh:
-			if result.err == nil && result.conn != nil {
-				// Success! Cancel all other methods
-				cancelInbound()
-				cancelOutbound()
-				cancelIndirect()
-				log.Printf("[DEBUG] getTransferConnection: success via %s", result.method)
-				return result.conn, nil
+		case <-o.ctx.Done():
+			return nil, o.ctx.Err()
+		case r := <-resultCh:
+			if r.err == nil && r.conn != nil {
+				cancel1()
+				cancel2()
+				cancel3()
+				log.Printf("[DEBUG] getTransferConnection: success via %s", r.method)
+				return r.conn, nil
 			}
-			// Track errors by method
-			switch result.method {
-			case "inbound":
-				inboundErr = result.err
-			case "outbound":
-				outboundErr = result.err
-			case "indirect":
-				indirectErr = result.err
-			}
+			errs = append(errs, fmt.Errorf("%s: %w", r.method, r.err))
 		}
 	}
 
-	// All failed
-	return nil, errors.Join(
-		fmt.Errorf("inbound: %w", inboundErr),
-		fmt.Errorf("outbound: %w", outboundErr),
-		fmt.Errorf("indirect: %w", indirectErr),
-	)
+	return nil, errors.Join(errs...)
 }
 
-// waitForInboundTransferConnection waits for the peer to connect to our listener.
-func (c *Client) waitForInboundTransferConnection(ctx context.Context, dl *activeDownload) (*connection.Conn, error) {
+// waitInboundConnection waits for peer to connect to our listener.
+func (o *downloadOrchestrator) waitInboundConnection(ctx context.Context) (*connection.Conn, error) {
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
-	case conn := <-dl.transferConnCh:
+	case conn := <-o.transfer.TransferConnCh():
 		if conn == nil {
-			return nil, errors.New("transfer connection closed")
+			return nil, errors.New("connection closed")
 		}
 		return conn, nil
 	}
 }
 
-// solicitTransferConnection asks the server to tell the peer to connect to us.
-// This is used when the peer cannot connect to us directly (e.g., due to NAT).
-func (c *Client) solicitTransferConnection(ctx context.Context, dl *activeDownload) (*connection.Conn, error) {
-	// Check if we have a listener running
-	if c.ListenerPort() == 0 {
-		return nil, errors.New("no listener running for indirect connections")
-	}
-
-	// Generate a solicitation token
-	solicitToken := atomic.AddUint32(&transferToken, 1)
-	log.Printf("[DEBUG] solicitTransferConnection: sending ConnectToPeerRequest type=F, token=%d, username=%s", solicitToken, dl.username)
-
-	// Create a channel to receive the incoming connection
-	connCh := make(chan *connection.Conn, 1)
-
-	// Register the pending solicitation
-	c.solicitations.mu.Lock()
-	c.solicitations.pending[solicitToken] = connCh
-	c.solicitations.mu.Unlock()
-
-	// Clean up on exit
-	defer func() {
-		c.solicitations.mu.Lock()
-		delete(c.solicitations.pending, solicitToken)
-		c.solicitations.mu.Unlock()
-	}()
-
-	// Send ConnectToPeerRequest(type=F) to the server
-	var buf bytes.Buffer
-	w := protocol.NewWriter(&buf)
-	req := &server.ConnectToPeerRequest{
-		Token:    solicitToken,
-		Username: dl.username,
-		Type:     server.ConnectionTypeTransfer, // "F" for file transfer
-	}
-	req.Encode(w)
-	if err := w.Error(); err != nil {
-		return nil, err
-	}
-
-	if err := c.WriteMessage(buf.Bytes()); err != nil {
-		return nil, fmt.Errorf("send connect request: %w", err)
-	}
-
-	// Wait for the peer to connect to us (via PierceFirewall)
-	var conn *connection.Conn
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case conn = <-connCh:
-		if conn == nil {
-			return nil, errors.New("connection closed")
-		}
-		log.Printf("[DEBUG] solicitTransferConnection: received connection via solicitation")
-	case <-time.After(30 * time.Second):
-		return nil, errors.New("indirect connection timeout")
-	}
-
-	// After PierceFirewall, the peer sends their remoteToken as 4 bytes
-	// We need to read this and verify it matches our expected remoteToken
-	var tokenBuf [4]byte
-	if err := conn.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("set deadline: %w", err)
-	}
-	if _, err := io.ReadFull(conn, tokenBuf[:]); err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("read remote token: %w", err)
-	}
-	remoteToken := binary.LittleEndian.Uint32(tokenBuf[:])
-	log.Printf("[DEBUG] solicitTransferConnection: read remoteToken=%d, expected=%d", remoteToken, dl.remoteToken)
-
-	// Verify the token matches (if we have one)
-	if dl.hasRemoteToken && remoteToken != dl.remoteToken {
-		conn.Close()
-		return nil, fmt.Errorf("remote token mismatch: got %d, expected %d", remoteToken, dl.remoteToken)
-	}
-
-	// Clear the deadline
-	if err := conn.SetReadDeadline(time.Time{}); err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("clear deadline: %w", err)
-	}
-
-	return conn, nil
-}
-
-// connectTransferDirect connects directly to the peer for file transfer.
-func (c *Client) connectTransferDirect(ctx context.Context, peerAddr string, dl *activeDownload) (*connection.Conn, error) {
-	// Wait until we have the remote token (peer sends TransferRequest with their token)
-	// We need this token to identify ourselves to the peer
+// connectDirectTransfer connects directly to peer for file transfer.
+func (o *downloadOrchestrator) connectDirectTransfer(ctx context.Context) (*connection.Conn, error) {
+	// Wait for remote token
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 
 	timeout := time.After(30 * time.Second)
 	for {
-		c.downloads.mu.RLock()
-		hasToken := dl.hasRemoteToken
-		remoteToken := dl.remoteToken
-		c.downloads.mu.RUnlock()
+		o.transfer.mu.RLock()
+		remoteToken := o.transfer.RemoteToken
+		o.transfer.mu.RUnlock()
 
-		if hasToken {
-			return c.dialTransferConnection(ctx, peerAddr, remoteToken)
+		if remoteToken != 0 {
+			return o.dialTransferConnection(ctx, remoteToken)
 		}
 
 		select {
@@ -822,32 +583,29 @@ func (c *Client) connectTransferDirect(ctx context.Context, peerAddr string, dl 
 		case <-timeout:
 			return nil, errors.New("timeout waiting for remote token")
 		case <-ticker.C:
-			// Continue polling
 		}
 	}
 }
 
-// dialTransferConnection establishes an outbound transfer connection to the peer.
-func (c *Client) dialTransferConnection(ctx context.Context, peerAddr string, remoteToken uint32) (*connection.Conn, error) {
-	log.Printf("[DEBUG] dialTransferConnection: dialing %s with remoteToken=%d", peerAddr, remoteToken)
-	conn, err := connection.Dial(ctx, peerAddr)
+// dialTransferConnection establishes an outbound transfer connection.
+func (o *downloadOrchestrator) dialTransferConnection(ctx context.Context, remoteToken uint32) (*connection.Conn, error) {
+	log.Printf("[DEBUG] dialTransferConnection: dialing %s with remoteToken=%d", o.peerAddr, remoteToken)
+
+	conn, err := connection.Dial(ctx, o.peerAddr)
 	if err != nil {
-		log.Printf("[DEBUG] dialTransferConnection: dial failed: %v", err)
 		return nil, fmt.Errorf("dial: %w", err)
 	}
-	log.Printf("[DEBUG] dialTransferConnection: connected, sending PeerInit")
 
-	// Send PeerInit with type "F" for file transfer, using the remote token
-	c.mu.Lock()
-	username := c.username
-	c.mu.Unlock()
+	o.client.mu.Lock()
+	username := o.client.username
+	o.client.mu.Unlock()
 
 	var buf bytes.Buffer
 	w := protocol.NewWriter(&buf)
 	init := &peer.Init{
 		Username: username,
 		Type:     "F",
-		Token:    remoteToken, // Use the peer's token so they can identify this transfer
+		Token:    remoteToken,
 	}
 	init.Encode(w)
 	if err := w.Error(); err != nil {
@@ -855,142 +613,256 @@ func (c *Client) dialTransferConnection(ctx context.Context, peerAddr string, re
 		return nil, err
 	}
 
-	log.Printf("[DEBUG] dialTransferConnection: PeerInit message: %x", buf.Bytes())
 	if err := conn.WriteMessage(buf.Bytes()); err != nil {
 		conn.Close()
-		log.Printf("[DEBUG] dialTransferConnection: send init failed: %v", err)
 		return nil, fmt.Errorf("send init: %w", err)
 	}
-	log.Printf("[DEBUG] dialTransferConnection: PeerInit sent, sending token bytes")
 
-	// After PeerInit, send the token as 4 raw bytes
-	// This is required by the protocol for direct transfer connections
 	var tokenBuf [4]byte
 	binary.LittleEndian.PutUint32(tokenBuf[:], remoteToken)
-	log.Printf("[DEBUG] dialTransferConnection: token bytes: %x", tokenBuf[:])
 	if _, err := conn.Write(tokenBuf[:]); err != nil {
 		conn.Close()
-		log.Printf("[DEBUG] dialTransferConnection: send token failed: %v", err)
 		return nil, fmt.Errorf("send token: %w", err)
 	}
-	log.Printf("[DEBUG] dialTransferConnection: token sent, connection ready")
 
 	return conn, nil
 }
 
-// performTransfer establishes a transfer connection and receives the file data.
-// This is used for immediate transfers (when the uploader responds with Allowed=true).
-// In this case, WE initiate the F-type connection using OUR token.
-func (c *Client) performTransfer(ctx context.Context, peerAddr string, dl *activeDownload) error {
-	dl.sendProgress(TransferStateInitializing, dl.fileSize, 0, 0, nil)
-
-	log.Printf("[DEBUG] performTransfer: starting immediate transfer to %s with our token=%d", peerAddr, dl.token)
-
-	// Establish transfer connection with timeout
-	dialCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-
-	conn, err := connection.Dial(dialCtx, peerAddr)
-	if err != nil {
-		log.Printf("[DEBUG] performTransfer: dial failed: %v", err)
-		return fmt.Errorf("dial transfer connection: %w", err)
+// solicitTransferConnection asks server to tell peer to connect to us.
+func (o *downloadOrchestrator) solicitTransferConnection(ctx context.Context) (*connection.Conn, error) {
+	if o.client.ListenerPort() == 0 {
+		return nil, errors.New("no listener running")
 	}
-	defer conn.Close()
 
-	log.Printf("[DEBUG] performTransfer: connected, sending PeerInit")
+	solicitToken := atomic.AddUint32(&transferToken, 1)
+	log.Printf("[DEBUG] solicitTransferConnection: sending ConnectToPeerRequest type=F, token=%d", solicitToken)
 
-	// Send PeerInit with type "F" for file transfer
-	// For immediate transfers, we use OUR token since there's no remoteToken yet
-	c.mu.Lock()
-	username := c.username
-	c.mu.Unlock()
+	connCh := make(chan *connection.Conn, 1)
 
+	o.client.solicitations.mu.Lock()
+	o.client.solicitations.pending[solicitToken] = connCh
+	o.client.solicitations.mu.Unlock()
+
+	defer func() {
+		o.client.solicitations.mu.Lock()
+		delete(o.client.solicitations.pending, solicitToken)
+		o.client.solicitations.mu.Unlock()
+	}()
+
+	// Send ConnectToPeerRequest
 	var buf bytes.Buffer
 	w := protocol.NewWriter(&buf)
-	init := &peer.Init{
-		Username: username,
-		Type:     "F",
-		Token:    dl.token, // Use OUR token for immediate transfers
+	req := &server.ConnectToPeerRequest{
+		Token:    solicitToken,
+		Username: o.transfer.Username,
+		Type:     server.ConnectionTypeTransfer,
 	}
-	init.Encode(w)
+	req.Encode(w)
 	if err := w.Error(); err != nil {
-		return err
+		return nil, err
+	}
+	if err := o.client.WriteMessage(buf.Bytes()); err != nil {
+		return nil, fmt.Errorf("send connect request: %w", err)
 	}
 
-	if err := conn.WriteMessage(buf.Bytes()); err != nil {
-		return fmt.Errorf("send init: %w", err)
+	// Wait for connection
+	var conn *connection.Conn
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case conn = <-connCh:
+		if conn == nil {
+			return nil, errors.New("connection closed")
+		}
+	case <-time.After(30 * time.Second):
+		return nil, errors.New("timeout")
 	}
 
-	// After PeerInit, send the token as 4 raw bytes
-	// This is required by the protocol for direct transfer connections
+	// Read remote token
 	var tokenBuf [4]byte
-	binary.LittleEndian.PutUint32(tokenBuf[:], dl.token)
-	if _, err := conn.Write(tokenBuf[:]); err != nil {
-		return fmt.Errorf("send token: %w", err)
+	if err := conn.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		conn.Close()
+		return nil, err
+	}
+	if _, err := io.ReadFull(conn, tokenBuf[:]); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("read token: %w", err)
+	}
+	remoteToken := binary.LittleEndian.Uint32(tokenBuf[:])
+
+	o.transfer.mu.RLock()
+	expectedToken := o.transfer.RemoteToken
+	o.transfer.mu.RUnlock()
+
+	if expectedToken != 0 && remoteToken != expectedToken {
+		conn.Close()
+		return nil, fmt.Errorf("token mismatch: got %d, want %d", remoteToken, expectedToken)
 	}
 
-	log.Printf("[DEBUG] performTransfer: PeerInit and token sent, sending offset")
+	if err := conn.SetReadDeadline(time.Time{}); err != nil {
+		conn.Close()
+		return nil, err
+	}
 
-	// Send 8-byte offset (0 for full file)
+	return conn, nil
+}
+
+// transferData streams data from the connection to the writer.
+func (o *downloadOrchestrator) transferData(conn *connection.Conn) error {
+	// Send offset
 	var offsetBuf [8]byte
-	// Offset 0 = start from beginning
+	binary.LittleEndian.PutUint64(offsetBuf[:], uint64(o.transfer.StartOffset)) //nolint:gosec // StartOffset is always non-negative
 	if _, err := conn.Write(offsetBuf[:]); err != nil {
 		return fmt.Errorf("send offset: %w", err)
 	}
 
-	log.Printf("[DEBUG] performTransfer: offset sent, receiving file data")
+	o.transfer.SetState(TransferStateInProgress)
+	o.transfer.emitProgress()
 
-	// Receive file data
-	dl.sendProgress(TransferStateInProgress, dl.fileSize, 0, 0, nil)
+	// Receive data
+	o.transfer.mu.RLock()
+	writer := o.transfer.writer
+	fileSize := o.transfer.Size
+	startOffset := o.transfer.StartOffset
+	o.transfer.mu.RUnlock()
 
-	return c.receiveFileData(ctx, conn, dl)
-}
+	toReceive := fileSize - startOffset
+	received := int64(0)
+	buf := make([]byte, 64*1024)
 
-// receiveFileData reads file data from the transfer connection.
-func (c *Client) receiveFileData(ctx context.Context, conn *connection.Conn, dl *activeDownload) error {
-	// Buffer for reading
-	buf := make([]byte, 64*1024) // 64KB buffer
-
-	var received int64
-	lastUpdate := time.Now()
-
-	for received < dl.fileSize {
+	for received < toReceive {
 		select {
-		case <-ctx.Done():
-			return ctx.Err()
+		case <-o.ctx.Done():
+			return o.ctx.Err()
 		default:
 		}
 
-		// Set read deadline
 		if err := conn.SetReadDeadline(time.Now().Add(30 * time.Second)); err != nil {
 			return err
 		}
 
-		// Calculate how much to read
-		remaining := dl.fileSize - received
+		remaining := toReceive - received
 		toRead := min(int64(len(buf)), remaining)
 
 		n, err := conn.Read(buf[:toRead])
 		if err != nil {
-			if errors.Is(err, io.EOF) && received == dl.fileSize {
-				break // Expected EOF at end of file
+			if errors.Is(err, io.EOF) && received == toReceive {
+				break
 			}
-			return fmt.Errorf("read file data: %w", err)
+			return fmt.Errorf("read: %w", err)
 		}
 
-		// Write to destination
-		if _, err := dl.writer.Write(buf[:n]); err != nil {
-			return fmt.Errorf("write file data: %w", err)
+		if _, err := writer.Write(buf[:n]); err != nil {
+			return fmt.Errorf("write: %w", err)
 		}
 
 		received += int64(n)
-
-		// Send progress update (throttled to avoid flooding)
-		if time.Since(lastUpdate) > 100*time.Millisecond {
-			dl.sendProgress(TransferStateInProgress, dl.fileSize, received, 0, nil)
-			lastUpdate = time.Now()
-		}
+		o.transfer.UpdateProgress(startOffset + received)
+		o.transfer.emitProgress()
 	}
 
 	return nil
+}
+
+// fail marks the transfer as failed with the given error.
+func (o *downloadOrchestrator) fail(err error) {
+	o.transfer.mu.Lock()
+	o.transfer.Error = err
+	o.transfer.mu.Unlock()
+
+	state := TransferStateCompleted
+	switch {
+	case errors.Is(err, context.Canceled):
+		state |= TransferStateCancelled
+	case errors.Is(err, context.DeadlineExceeded):
+		state |= TransferStateTimedOut
+	default:
+		var rejected *TransferRejectedError
+		if errors.As(err, &rejected) {
+			state |= TransferStateRejected
+		} else {
+			state |= TransferStateErrored
+		}
+	}
+
+	o.transfer.SetState(state)
+	o.transfer.emitProgress()
+}
+
+// complete marks the transfer as successfully completed.
+func (o *downloadOrchestrator) complete() {
+	o.transfer.mu.Lock()
+	o.transfer.Transferred = o.transfer.Size
+	o.transfer.mu.Unlock()
+
+	o.transfer.SetState(TransferStateCompleted | TransferStateSucceeded)
+	o.transfer.emitProgress()
+}
+
+// cleanup releases resources when the download completes or fails.
+func (o *downloadOrchestrator) cleanup() {
+	o.cancel()
+	// Remove from registry - this also closes the progress channel
+	o.client.transfers.Remove(o.transfer.Token)
+}
+
+// deliverTransferConnection delivers an F-type connection to a pending download.
+// This is called when a peer connects to our listener with a transfer connection.
+func (c *Client) deliverTransferConnection(username string, remoteToken uint32, conn *connection.Conn) {
+	tr, ok := c.transfers.GetByRemoteToken(username, remoteToken)
+	if !ok {
+		log.Printf("[DEBUG] deliverTransferConnection: no pending transfer for %s token=%d", username, remoteToken)
+		return
+	}
+
+	connCh := tr.TransferConnCh()
+	if connCh == nil {
+		log.Printf("[WARN] deliverTransferConnection: transfer conn channel not initialized")
+		return
+	}
+
+	select {
+	case connCh <- conn:
+		log.Printf("[DEBUG] deliverTransferConnection: delivered connection for %s token=%d", username, remoteToken)
+	default:
+		log.Printf("[WARN] deliverTransferConnection: transfer conn channel full")
+	}
+}
+
+// handleTransferRequest handles TransferRequest messages from peers.
+// When direction is Upload, it signals the corresponding download transfer.
+// This is called when the peer is ready to send us a file we requested.
+func (c *Client) handleTransferRequest(payload []byte, username string, _ *connection.Conn) {
+	req, err := peer.DecodeTransferRequest(payload)
+	if err != nil {
+		log.Printf("[WARN] handleTransferRequest: decode error: %v", err)
+		return
+	}
+
+	// Only handle Upload direction (peer wants to send file to us)
+	if req.Direction != peer.TransferUpload {
+		return
+	}
+
+	// Look up the download transfer
+	tr, ok := c.transfers.GetByFile(username, req.Filename, peer.TransferDownload)
+	if !ok {
+		log.Printf("[DEBUG] handleTransferRequest: no pending download for %s from %s", req.Filename, username)
+		return
+	}
+
+	// Signal the transfer with remote token and file size
+	readyCh := tr.TransferReadyCh()
+	if readyCh == nil {
+		log.Printf("[WARN] handleTransferRequest: transfer ready channel not initialized")
+		return
+	}
+
+	select {
+	case readyCh <- TransferReadyInfo{RemoteToken: req.Token, FileSize: req.FileSize}:
+		log.Printf("[DEBUG] handleTransferRequest: signaled transfer for %s, token=%d, size=%d",
+			req.Filename, req.Token, req.FileSize)
+	default:
+		log.Printf("[WARN] handleTransferRequest: transfer ready channel full")
+	}
 }

@@ -6,7 +6,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"log"
 	"net"
 	"sync"
 	"time"
@@ -23,7 +22,6 @@ type Client struct {
 	conn          *connection.Conn
 	router        *MessageRouter
 	searches      *searchRegistry
-	downloads     *downloadRegistry
 	transfers     *TransferRegistry // Unified transfer tracking
 	listener      *Listener
 	peerConnMgr   *peerConnManager      // Manages P-type connections to peers
@@ -58,7 +56,6 @@ func New(opts *Options) *Client {
 		opts:          opts,
 		router:        NewMessageRouter(),
 		searches:      newSearchRegistry(),
-		downloads:     newDownloadRegistry(),
 		transfers:     NewTransferRegistry(),
 		solicitations: newPendingSolicitations(),
 		peerSolicits:  newPendingPeerSolicits(),
@@ -283,7 +280,6 @@ func (c *Client) runReadLoop() {
 
 			// Close all active channels
 			c.searches.closeAll()
-			c.downloads.closeAll()
 			return
 		}
 
@@ -351,7 +347,6 @@ func (c *Client) Disconnect() error {
 
 	// Close all active channels
 	c.searches.closeAll()
-	c.downloads.closeAll()
 
 	// Close peer connection manager
 	c.peerConnMgr.Close()
@@ -530,7 +525,7 @@ func (c *Client) handleIncomingPeerMessages(conn *connection.Conn, username stri
 			// Don't return - keep connection open for potential transfer messages
 
 		case uint32(protocol.PeerTransferRequest):
-			c.handlePeerTransferRequestWithConn(payload, username, conn)
+			c.handleTransferRequest(payload, username, conn)
 
 		case uint32(protocol.PeerTransferResponse):
 			// Handle transfer response from peer
@@ -548,81 +543,6 @@ func (c *Client) handleIncomingPeerMessages(conn *connection.Conn, username stri
 	}
 }
 
-// handlePeerTransferRequestWithConn handles TransferRequest messages from peers.
-// When a peer sends TransferRequest with Upload direction, they're ready to send us a file.
-// This can arrive on ANY message connection from the peer, not just the one we established.
-func (c *Client) handlePeerTransferRequestWithConn(payload []byte, username string, conn *connection.Conn) {
-	req, err := peer.DecodeTransferRequest(payload)
-	if err != nil {
-		log.Printf("[DEBUG] handlePeerTransferRequest: decode failed: %v", err)
-		return
-	}
-	log.Printf("[DEBUG] handlePeerTransferRequest: from %s, direction=%d, filename=%s, token=%d, fileSize=%d",
-		username, req.Direction, req.Filename, req.Token, req.FileSize)
-
-	// Only handle Upload direction (peer is offering to send us a file)
-	if req.Direction != peer.TransferUpload {
-		log.Printf("[DEBUG] handlePeerTransferRequest: ignoring non-upload direction %d", req.Direction)
-		return
-	}
-
-	// Find the matching download by username and filename
-	dl := c.downloads.getByFile(username, req.Filename)
-	if dl == nil {
-		log.Printf("[DEBUG] handlePeerTransferRequest: no matching download for %s/%s", username, req.Filename)
-		// Send rejection if we have a connection
-		if conn != nil {
-			var buf bytes.Buffer
-			w := protocol.NewWriter(&buf)
-			resp := &peer.TransferResponse{
-				Token:   req.Token,
-				Allowed: false,
-				Reason:  "Cancelled",
-			}
-			resp.Encode(w)
-			if w.Error() == nil {
-				_ = conn.WriteMessage(buf.Bytes())
-			}
-		}
-		return
-	}
-
-	// Store the remote token - this is what we'll use to match the transfer connection
-	log.Printf("[DEBUG] handlePeerTransferRequest: setting remoteToken=%d for download", req.Token)
-	c.downloads.setRemoteToken(dl, req.Token)
-
-	// Send TransferResponse if we have a connection
-	if conn != nil {
-		var buf bytes.Buffer
-		w := protocol.NewWriter(&buf)
-		resp := &peer.TransferResponse{
-			Token:    req.Token,
-			Allowed:  true,
-			FileSize: req.FileSize,
-		}
-		resp.Encode(w)
-		if err := w.Error(); err == nil {
-			if err := conn.WriteMessage(buf.Bytes()); err != nil {
-				log.Printf("[DEBUG] handlePeerTransferRequest: failed to send response: %v", err)
-			} else {
-				log.Printf("[DEBUG] handlePeerTransferRequest: sent TransferResponse Allowed=true for token=%d", req.Token)
-			}
-		}
-	}
-
-	// Signal the download that TransferRequest(Upload) has arrived
-	// This unblocks waitForPeerTransfer which may be waiting on a different connection
-	select {
-	case dl.transferReadyCh <- transferReadyInfo{remoteToken: req.Token, fileSize: req.FileSize}:
-		log.Printf("[DEBUG] handlePeerTransferRequest: signaled transferReadyCh for download")
-	default:
-		log.Printf("[DEBUG] handlePeerTransferRequest: transferReadyCh already has a value")
-	}
-
-	// Update progress
-	dl.sendProgress(TransferStateInitializing, req.FileSize, 0, 0, nil)
-}
-
 // handlePlaceInQueueResponse handles queue position updates.
 func (c *Client) handlePlaceInQueueResponse(payload []byte, username string) {
 	resp, err := peer.DecodePlaceInQueueResponse(payload)
@@ -630,9 +550,9 @@ func (c *Client) handlePlaceInQueueResponse(payload []byte, username string) {
 		return
 	}
 
-	dl := c.downloads.getByFile(username, resp.Filename)
-	if dl != nil {
-		dl.sendProgress(TransferStateQueued|TransferStateRemotely, dl.fileSize, 0, resp.Place, nil)
+	tr, ok := c.transfers.GetByFile(username, resp.Filename, peer.TransferDownload)
+	if ok {
+		tr.emitProgress()
 	}
 }
 
@@ -643,9 +563,13 @@ func (c *Client) handleUploadDenied(payload []byte, username string) {
 		return
 	}
 
-	dl := c.downloads.getByFile(username, denied.Filename)
-	if dl != nil {
-		dl.sendProgress(TransferStateCompleted|TransferStateErrored, dl.fileSize, 0, 0, fmt.Errorf("upload denied: %s", denied.Reason))
+	tr, ok := c.transfers.GetByFile(username, denied.Filename, peer.TransferDownload)
+	if ok {
+		tr.mu.Lock()
+		tr.Error = fmt.Errorf("upload denied: %s", denied.Reason)
+		tr.mu.Unlock()
+		tr.SetState(TransferStateCompleted | TransferStateErrored)
+		tr.emitProgress()
 	}
 }
 
@@ -656,8 +580,12 @@ func (c *Client) handleUploadFailed(payload []byte, username string) {
 		return
 	}
 
-	dl := c.downloads.getByFile(username, failed.Filename)
-	if dl != nil {
-		dl.sendProgress(TransferStateCompleted|TransferStateErrored, dl.fileSize, 0, 0, errors.New("upload failed"))
+	tr, ok := c.transfers.GetByFile(username, failed.Filename, peer.TransferDownload)
+	if ok {
+		tr.mu.Lock()
+		tr.Error = errors.New("upload failed")
+		tr.mu.Unlock()
+		tr.SetState(TransferStateCompleted | TransferStateErrored)
+		tr.emitProgress()
 	}
 }
