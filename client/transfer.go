@@ -70,6 +70,9 @@ type Transfer struct {
 	// Writer for download destination (set by DownloadV2)
 	writer io.Writer
 
+	// sharedFile reference for uploads (set by upload processor)
+	sharedFile *SharedFile
+
 	mu sync.RWMutex
 }
 
@@ -312,4 +315,18 @@ func (t *Transfer) TransferConnCh() chan *connection.Conn {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	return t.transferConnCh
+}
+
+// SharedFile returns the shared file reference for uploads.
+func (t *Transfer) SharedFile() *SharedFile {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.sharedFile
+}
+
+// SetSharedFile sets the shared file reference for uploads.
+func (t *Transfer) SetSharedFile(sf *SharedFile) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.sharedFile = sf
 }

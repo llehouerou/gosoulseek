@@ -24,6 +24,8 @@ type Client struct {
 	searches        *searchRegistry
 	transfers       *TransferRegistry // Unified transfer tracking
 	queueMgr        *QueueManager     // Manages upload queue positions
+	slots           *SlotManager      // Manages upload/download concurrency
+	uploadProc      *uploadProcessor  // Processes queued uploads
 	listener        *Listener
 	peerConnMgr     *peerConnManager           // Manages P-type connections to peers
 	transferConnMgr *TransferConnectionManager // Manages F-type transfer connections
@@ -63,9 +65,16 @@ func New(opts *Options) *Client {
 		solicitations: newPendingSolicitations(),
 		peerSolicits:  newPendingPeerSolicits(),
 	}
+	c.slots = NewSlotManagerWithCleanup(
+		opts.MaxConcurrentDownloads,
+		opts.MaxConcurrentUploads,
+		opts.SlotCleanupInterval,
+		opts.SlotIdleThreshold,
+	)
 	c.peerConnMgr = newPeerConnManager(c)
 	c.transferConnMgr = NewTransferConnectionManager(c)
 	c.listener = newListener(c)
+	c.uploadProc = newUploadProcessor(c.slots, c.queueMgr, c.transfers, opts.FileSharer)
 	return c
 }
 
@@ -200,6 +209,9 @@ func (c *Client) Login(ctx context.Context, username, password string) error {
 	// Start the read loop
 	c.running = true
 	go c.runReadLoop()
+
+	// Start upload processor
+	c.uploadProc.Start()
 
 	return nil
 }
@@ -358,6 +370,16 @@ func (c *Client) Disconnect() error {
 
 	// Close peer connection manager
 	c.peerConnMgr.Close()
+
+	// Stop upload processor
+	if c.uploadProc != nil {
+		c.uploadProc.Stop()
+	}
+
+	// Close slot manager
+	if c.slots != nil {
+		c.slots.Close()
+	}
 
 	// Wait for read loop to finish (outside lock to avoid deadlock)
 	if c.doneCh != nil {
