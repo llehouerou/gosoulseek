@@ -63,6 +63,10 @@ type Options struct {
 	// SlotIdleThreshold is how long a per-user slot must be idle before cleanup.
 	// Default: 15 minutes
 	SlotIdleThreshold time.Duration
+
+	// FileSharer is the shared file index for uploads.
+	// If nil, no files are shared.
+	FileSharer *FileSharer
 }
 
 // DefaultOptions returns Options with sensible defaults.

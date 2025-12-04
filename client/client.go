@@ -310,10 +310,14 @@ func (c *Client) sendPostLoginConfig() error {
 		return fmt.Errorf("send status: %w", err)
 	}
 
-	// Report shared files (0 for now - no share management yet)
+	// Report shared files
+	dirs, files := 0, 0
+	if c.opts.FileSharer != nil {
+		dirs, files = c.opts.FileSharer.GetStats()
+	}
 	buf.Reset()
 	w = protocol.NewWriter(&buf)
-	(&server.SharedFoldersAndFiles{Directories: 0, Files: 0}).Encode(w)
+	(&server.SharedFoldersAndFiles{Directories: uint32(dirs), Files: uint32(files)}).Encode(w)
 	if err := w.Error(); err != nil {
 		return fmt.Errorf("encode shares: %w", err)
 	}
