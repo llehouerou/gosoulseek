@@ -17,9 +17,8 @@ import (
 )
 
 const (
-	transferConnTimeout   = 30 * time.Second
-	transferTokenTimeout  = 10 * time.Second
-	transferRemoteTimeout = 30 * time.Second
+	transferConnTimeout  = 30 * time.Second
+	transferTokenTimeout = 10 * time.Second
 )
 
 // TransferConnectionManager handles F-type transfer connection establishment.
@@ -227,79 +226,13 @@ func (m *TransferConnectionManager) GetConnection(ctx context.Context, username,
 }
 
 // AwaitConnection waits for a transfer connection from the peer (receiver/downloader role).
-// Uses triple strategy: inbound (wait on listener), direct, and indirect - racing all three.
-// The transfer must have RemoteToken set and TransferConnCh initialized.
-func (m *TransferConnectionManager) AwaitConnection(ctx context.Context, transfer *Transfer, peerAddr string) (*connection.Conn, error) {
-	type result struct {
-		conn   *connection.Conn
-		method string
-		err    error
-	}
-	resultCh := make(chan result, 3)
-
-	// Create cancellable contexts for each strategy
-	ctx1, cancel1 := context.WithCancel(ctx)
-	ctx2, cancel2 := context.WithCancel(ctx)
-	ctx3, cancel3 := context.WithCancel(ctx)
-	defer cancel1()
-	defer cancel2()
-	defer cancel3()
-
-	// Strategy 1: Wait for inbound connection via listener
-	go func() {
-		conn, err := m.waitInbound(ctx1, transfer)
-		select {
-		case resultCh <- result{conn, "inbound", err}:
-		case <-ctx1.Done():
-			if conn != nil {
-				conn.Close()
-			}
-		}
-	}()
-
-	// Strategy 2: Direct connection to peer
-	go func() {
-		conn, err := m.awaitDirect(ctx2, transfer, peerAddr)
-		select {
-		case resultCh <- result{conn, "direct", err}:
-		case <-ctx2.Done():
-			if conn != nil {
-				conn.Close()
-			}
-		}
-	}()
-
-	// Strategy 3: Indirect connection via server
-	go func() {
-		conn, err := m.connectIndirect(ctx3, transfer.Username, transfer.RemoteToken)
-		select {
-		case resultCh <- result{conn, "indirect", err}:
-		case <-ctx3.Done():
-			if conn != nil {
-				conn.Close()
-			}
-		}
-	}()
-
-	// Wait for first success or all failures
-	var errs []error
-	for range 3 {
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case r := <-resultCh:
-			if r.err == nil && r.conn != nil {
-				// Success! Cancel other strategies and return
-				cancel1()
-				cancel2()
-				cancel3()
-				return r.conn, nil
-			}
-			errs = append(errs, fmt.Errorf("%s: %w", r.method, r.err))
-		}
-	}
-
-	return nil, errors.Join(errs...)
+// As the downloader, we only WAIT for the peer (uploader) to initiate the transfer connection.
+// Connections arrive via two paths, both delivered to TransferConnCh:
+// 1. Peer connects directly to our listener
+// 2. Server sends ConnectToPeer, we connect with PierceFirewall (handled by connectToPeerForTransfer)
+// The transfer must have TransferConnCh initialized.
+func (m *TransferConnectionManager) AwaitConnection(ctx context.Context, transfer *Transfer, _ string) (*connection.Conn, error) {
+	return m.waitInbound(ctx, transfer)
 }
 
 // waitInbound waits for the peer to connect to our listener.
@@ -313,32 +246,5 @@ func (m *TransferConnectionManager) waitInbound(ctx context.Context, transfer *T
 			return nil, errors.New("connection channel closed")
 		}
 		return conn, nil
-	}
-}
-
-// awaitDirect connects directly to the peer using RemoteToken.
-// It waits for RemoteToken to be set if not already available.
-func (m *TransferConnectionManager) awaitDirect(ctx context.Context, transfer *Transfer, peerAddr string) (*connection.Conn, error) {
-	// Wait for RemoteToken to be available
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
-
-	timeout := time.After(transferRemoteTimeout)
-	for {
-		transfer.mu.RLock()
-		remoteToken := transfer.RemoteToken
-		transfer.mu.RUnlock()
-
-		if remoteToken != 0 {
-			return m.connectDirect(ctx, peerAddr, remoteToken)
-		}
-
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-timeout:
-			return nil, errors.New("timeout waiting for remote token")
-		case <-ticker.C:
-		}
 	}
 }

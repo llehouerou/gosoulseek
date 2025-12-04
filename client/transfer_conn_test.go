@@ -39,44 +39,45 @@ func TestTransferConnectionManager_ConnectDirect(t *testing.T) {
 	type peerReceived struct {
 		init  *peer.Init
 		token uint32
+		err   error
 	}
 	receivedCh := make(chan peerReceived, 1)
+	acceptedCh := make(chan struct{})
 
 	// Mock peer accepts and reads handshake
 	go func() {
 		conn, err := listener.Accept()
 		if err != nil {
+			receivedCh <- peerReceived{err: err}
 			return
 		}
+		close(acceptedCh)
+		defer conn.Close()
 
 		c := connection.NewConn(conn)
 
 		// Read PeerInit message
 		data, err := c.ReadMessage()
 		if err != nil {
-			conn.Close()
+			receivedCh <- peerReceived{err: err}
 			return
 		}
 
 		init, err := peer.DecodeInit(data)
 		if err != nil {
-			conn.Close()
+			receivedCh <- peerReceived{err: err}
 			return
 		}
 
-		// Read 4-byte token
+		// Read 4-byte token (must use buffered reader, not raw conn)
 		var tokenBuf [4]byte
-		if _, err := conn.Read(tokenBuf[:]); err != nil {
-			conn.Close()
+		if _, err := c.Read(tokenBuf[:]); err != nil {
+			receivedCh <- peerReceived{err: err}
 			return
 		}
 		token := binary.LittleEndian.Uint32(tokenBuf[:])
 
 		receivedCh <- peerReceived{init: init, token: token}
-
-		// Keep connection open until test completes
-		time.Sleep(500 * time.Millisecond)
-		conn.Close()
 	}()
 
 	// Create client with username
@@ -85,7 +86,7 @@ func TestTransferConnectionManager_ConnectDirect(t *testing.T) {
 	}
 	mgr := NewTransferConnectionManager(client)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	// Call connectDirect
@@ -95,9 +96,19 @@ func TestTransferConnectionManager_ConnectDirect(t *testing.T) {
 	}
 	defer conn.Close()
 
+	// Wait for connection to be accepted
+	select {
+	case <-acceptedCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for connection to be accepted")
+	}
+
 	// Verify what the peer received
 	select {
 	case received := <-receivedCh:
+		if received.err != nil {
+			t.Fatalf("peer goroutine error: %v", received.err)
+		}
 		if received.init.Username != "testuser" {
 			t.Errorf("expected username 'testuser', got %q", received.init.Username)
 		}
@@ -110,7 +121,7 @@ func TestTransferConnectionManager_ConnectDirect(t *testing.T) {
 		if received.token != 12345 {
 			t.Errorf("expected raw token 12345, got %d", received.token)
 		}
-	case <-time.After(2 * time.Second):
+	case <-time.After(10 * time.Second):
 		t.Fatal("timeout waiting for peer to receive data")
 	}
 }
