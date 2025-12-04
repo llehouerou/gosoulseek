@@ -1,7 +1,22 @@
 // Package client provides a high-level Soulseek client.
 package client
 
-import "time"
+import (
+	"errors"
+	"time"
+)
+
+// UploadValidator validates incoming upload requests.
+// Called when a peer sends QueueDownload requesting a file from us.
+// Return nil to accept, or an error to reject with the error message sent to peer.
+type UploadValidator func(username, filename string) error
+
+// Common rejection errors for use with UploadValidator.
+var (
+	ErrFileNotShared = errors.New("file not shared")
+	ErrQueueFull     = errors.New("queue is full")
+	ErrUserBlocked   = errors.New("user is blocked")
+)
 
 const (
 	// DefaultServerAddress is the official Soulseek server.
@@ -67,6 +82,11 @@ type Options struct {
 	// FileSharer is the shared file index for uploads.
 	// If nil, no files are shared.
 	FileSharer *FileSharer
+
+	// UploadValidator is called to validate incoming upload requests.
+	// If nil, requests are accepted if the file exists in FileSharer.
+	// Return an error to reject the request; the error message is sent to the peer.
+	UploadValidator UploadValidator
 }
 
 // DefaultOptions returns Options with sensible defaults.

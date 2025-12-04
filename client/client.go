@@ -547,6 +547,12 @@ func (c *Client) handleIncomingPeerMessages(conn *connection.Conn, username stri
 
 		case uint32(protocol.PeerUploadFailed):
 			c.handleUploadFailed(payload, username)
+
+		case uint32(protocol.PeerQueueDownload):
+			c.handleQueueDownload(payload, username, conn)
+
+		case uint32(protocol.PeerPlaceInQueueRequest):
+			c.handlePlaceInQueueRequest(payload, username, conn)
 		}
 	}
 }
