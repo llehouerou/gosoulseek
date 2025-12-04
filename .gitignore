@@ -22,3 +22,8 @@ Soulseek.NET/
 
 # Environment files (use .env.example as template)
 .env
+
+*.mp3
+*.flac
+*.wav
+*.ogg
