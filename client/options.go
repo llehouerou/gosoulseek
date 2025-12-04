@@ -12,6 +12,20 @@ const (
 
 	// DefaultMessageTimeout is the default timeout for waiting on message responses.
 	DefaultMessageTimeout = 5 * time.Second
+
+	// DefaultMaxConcurrentDownloads is the default limit for concurrent downloads.
+	// 0 means unlimited.
+	DefaultMaxConcurrentDownloads = 10
+
+	// DefaultMaxConcurrentUploads is the default limit for concurrent uploads.
+	// 0 means unlimited.
+	DefaultMaxConcurrentUploads = 10
+
+	// DefaultSlotCleanupInterval is how often idle per-user upload slots are cleaned up.
+	DefaultSlotCleanupInterval = 15 * time.Minute
+
+	// DefaultSlotIdleThreshold is how long a per-user slot must be idle before cleanup.
+	DefaultSlotIdleThreshold = 15 * time.Minute
 )
 
 // Options configures the Soulseek client.
@@ -32,14 +46,35 @@ type Options struct {
 	// MessageTimeout is the timeout for waiting on message responses.
 	// Default: 5s
 	MessageTimeout time.Duration
+
+	// MaxConcurrentDownloads limits concurrent downloads (0 = unlimited).
+	// Default: 10
+	MaxConcurrentDownloads int
+
+	// MaxConcurrentUploads limits concurrent uploads (0 = unlimited).
+	// Default: 10
+	MaxConcurrentUploads int
+
+	// SlotCleanupInterval controls how often idle per-user upload slots are cleaned up.
+	// Set to 0 to disable automatic cleanup.
+	// Default: 15 minutes
+	SlotCleanupInterval time.Duration
+
+	// SlotIdleThreshold is how long a per-user slot must be idle before cleanup.
+	// Default: 15 minutes
+	SlotIdleThreshold time.Duration
 }
 
 // DefaultOptions returns Options with sensible defaults.
 func DefaultOptions() *Options {
 	return &Options{
-		ListenPort:     0,
-		ServerAddress:  DefaultServerAddress,
-		ConnectTimeout: DefaultConnectTimeout,
-		MessageTimeout: DefaultMessageTimeout,
+		ListenPort:             0,
+		ServerAddress:          DefaultServerAddress,
+		ConnectTimeout:         DefaultConnectTimeout,
+		MessageTimeout:         DefaultMessageTimeout,
+		MaxConcurrentDownloads: DefaultMaxConcurrentDownloads,
+		MaxConcurrentUploads:   DefaultMaxConcurrentUploads,
+		SlotCleanupInterval:    DefaultSlotCleanupInterval,
+		SlotIdleThreshold:      DefaultSlotIdleThreshold,
 	}
 }
