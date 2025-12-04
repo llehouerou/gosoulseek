@@ -173,3 +173,46 @@ func TestTransferState_IsRemote(t *testing.T) {
 		})
 	}
 }
+
+func TestClassifyTransferError(t *testing.T) {
+	tests := []struct {
+		name     string
+		err      error
+		expected TransferState
+	}{
+		{
+			name:     "TransferRejectedError",
+			err:      &TransferRejectedError{Reason: "access denied"},
+			expected: TransferStateRejected,
+		},
+		{
+			name:     "TransferSizeMismatchError",
+			err:      &TransferSizeMismatchError{LocalSize: 100, RemoteSize: 200},
+			expected: TransferStateAborted,
+		},
+		{
+			name:     "TransferFailedError",
+			err:      &TransferFailedError{Username: "user", Filename: "file"},
+			expected: TransferStateErrored,
+		},
+		{
+			name:     "ConnectionError",
+			err:      &ConnectionError{Operation: "read", BytesSoFar: 0, TotalBytes: 100, Underlying: nil},
+			expected: TransferStateErrored,
+		},
+		{
+			name:     "generic error",
+			err:      &TransferNotFoundError{Token: 123},
+			expected: TransferStateErrored,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := classifyTransferError(tt.err)
+			if got != tt.expected {
+				t.Errorf("classifyTransferError() = %v, want %v", got.String(), tt.expected.String())
+			}
+		})
+	}
+}

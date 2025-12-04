@@ -602,9 +602,9 @@ func (c *Client) handleUploadDenied(payload []byte, username string) {
 	tr, ok := c.transfers.GetByFile(username, denied.Filename, peer.TransferDownload)
 	if ok {
 		tr.mu.Lock()
-		tr.Error = fmt.Errorf("upload denied: %s", denied.Reason)
+		tr.Error = &TransferRejectedError{Reason: denied.Reason}
 		tr.mu.Unlock()
-		tr.SetState(TransferStateCompleted | TransferStateErrored)
+		tr.SetState(TransferStateCompleted | TransferStateRejected)
 		tr.emitProgress()
 	}
 }
@@ -619,7 +619,7 @@ func (c *Client) handleUploadFailed(payload []byte, username string) {
 	tr, ok := c.transfers.GetByFile(username, failed.Filename, peer.TransferDownload)
 	if ok {
 		tr.mu.Lock()
-		tr.Error = errors.New("upload failed")
+		tr.Error = &TransferFailedError{Username: username, Filename: failed.Filename}
 		tr.mu.Unlock()
 		tr.SetState(TransferStateCompleted | TransferStateErrored)
 		tr.emitProgress()

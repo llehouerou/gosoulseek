@@ -24,6 +24,7 @@ type uploadOrchestrator struct {
 	cancel    context.CancelFunc
 	queueMgr  *QueueManager
 	transfers *TransferRegistry
+	peerConn  net.Conn // Peer connection for notifications (may be nil)
 }
 
 // acquireSlots acquires both per-user and global upload slots.
@@ -77,12 +78,7 @@ func (o *uploadOrchestrator) fail(err error) {
 	case errors.Is(err, context.DeadlineExceeded):
 		state |= TransferStateTimedOut
 	default:
-		var rejected *TransferRejectedError
-		if errors.As(err, &rejected) {
-			state |= TransferStateRejected
-		} else {
-			state |= TransferStateErrored
-		}
+		state |= classifyTransferError(err)
 	}
 
 	o.transfer.SetState(state)
@@ -105,6 +101,9 @@ func (o *uploadOrchestrator) cleanup() {
 		o.cancel()
 	}
 
+	// Notify peer of failure (best-effort, prevents re-queueing)
+	o.notifyPeerOfFailure()
+
 	// Release slots
 	if o.slots != nil {
 		o.slots.ReleaseUploadSlot(o.username)
@@ -119,6 +118,48 @@ func (o *uploadOrchestrator) cleanup() {
 	if o.transfers != nil {
 		o.transfers.Remove(o.transfer.Token)
 	}
+}
+
+// notifyPeerOfFailure sends UploadDenied or UploadFailed to the peer.
+// This is best-effort - errors are silently ignored.
+// Notifying the peer prevents them from re-enqueueing the failed transfer.
+func (o *uploadOrchestrator) notifyPeerOfFailure() {
+	// Only notify if transfer failed (not succeeded)
+	state := o.transfer.State()
+	if state&TransferStateSucceeded != 0 {
+		return
+	}
+
+	// Need a peer connection to notify
+	if o.peerConn == nil {
+		return
+	}
+
+	var buf bytes.Buffer
+	w := protocol.NewWriter(&buf)
+
+	if state&TransferStateCancelled != 0 {
+		// Send UploadDenied with "Cancelled" reason
+		denied := &peer.UploadDenied{
+			Filename: o.transfer.Filename,
+			Reason:   "Cancelled",
+		}
+		denied.Encode(w)
+	} else {
+		// Send UploadFailed for other errors
+		failed := &peer.UploadFailed{
+			Filename: o.transfer.Filename,
+		}
+		failed.Encode(w)
+	}
+
+	if w.Error() != nil {
+		return
+	}
+
+	// Best-effort send with short timeout
+	_ = o.peerConn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	_, _ = o.peerConn.Write(buf.Bytes())
 }
 
 // waitForResponse waits for a TransferResponse from the peer.
@@ -238,7 +279,12 @@ func (o *uploadOrchestrator) streamFile(conn net.Conn) error {
 		}
 
 		if _, err := conn.Write(buf[:n]); err != nil {
-			return fmt.Errorf("write: %w", err)
+			return &ConnectionError{
+				Operation:  "write",
+				BytesSoFar: offset + sent,
+				TotalBytes: o.transfer.Size,
+				Underlying: err,
+			}
 		}
 
 		sent += int64(n)

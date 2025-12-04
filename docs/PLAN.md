@@ -18,7 +18,7 @@ This document outlines the strategic task breakdown for implementing complete do
 | **4.1** | File Sharing | None | Index shared folders, path translation |
 | **4.2** | Upload Requests | 1.3, 4.1 | Handle QueueDownloadRequest, queue uploads |
 | **4.3** | Upload Execution | 2.2, 3.1, 4.1, 4.2 | Full upload flow with slot management |
-| **5.1** | Error Handling | All | Robust recovery, proper cleanup |
+| **5.1** | Error Handling | All | ✅ Robust recovery, proper cleanup |
 
 **Approach**: Full rewrite of download code, aggressive defaults (10/10 concurrent), browse/speed-limit deferred.
 

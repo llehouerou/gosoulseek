@@ -1,6 +1,7 @@
 package client
 
 import (
+	"errors"
 	"strings"
 	"testing"
 
@@ -73,5 +74,46 @@ func TestTransferSizeMismatchError(t *testing.T) {
 
 	if !strings.Contains(msg, "1000") || !strings.Contains(msg, "2000") {
 		t.Errorf("Error() = %q, want to contain sizes", msg)
+	}
+}
+
+func TestTransferFailedError(t *testing.T) {
+	err := &TransferFailedError{
+		Username: "testuser",
+		Filename: "@@music/file.mp3",
+	}
+	msg := err.Error()
+
+	if !strings.Contains(msg, "testuser") {
+		t.Errorf("Error() = %q, want to contain username", msg)
+	}
+	if !strings.Contains(msg, "file.mp3") {
+		t.Errorf("Error() = %q, want to contain filename", msg)
+	}
+}
+
+func TestConnectionError(t *testing.T) {
+	underlying := &TransferRejectedError{Reason: "timeout"}
+	err := &ConnectionError{
+		Operation:  "read",
+		BytesSoFar: 5000,
+		TotalBytes: 10000,
+		Underlying: underlying,
+	}
+	msg := err.Error()
+
+	if !strings.Contains(msg, "read") {
+		t.Errorf("Error() = %q, want to contain operation", msg)
+	}
+	if !strings.Contains(msg, "5000") {
+		t.Errorf("Error() = %q, want to contain bytes so far", msg)
+	}
+	if !strings.Contains(msg, "10000") {
+		t.Errorf("Error() = %q, want to contain total bytes", msg)
+	}
+
+	// Test Unwrap - use errors.Is to verify the underlying error is accessible
+	if !errors.Is(err, underlying) {
+		t.Errorf("errors.Is(err, underlying) = false, want true")
 	}
 }

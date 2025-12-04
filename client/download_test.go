@@ -598,3 +598,176 @@ func newTestClientWithQueueManager(t *testing.T) *Client {
 	client.queueMgr = NewQueueManager()
 	return client
 }
+
+// TestHandleUploadDenied_SetsRejectedState verifies UploadDenied handler
+// sets the correct state (Rejected, not Errored).
+func TestHandleUploadDenied_SetsRejectedState(t *testing.T) {
+	client := newTestClient(t)
+	client.loggedIn = true
+	defer func() { _ = client.Disconnect() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	var buf bytes.Buffer
+	_, err := client.Download(ctx, "testpeer", "@@music/file.mp3", &buf)
+	if err != nil {
+		t.Fatalf("Download() error = %v", err)
+	}
+
+	// Get the transfer
+	tr, ok := client.transfers.GetByFile("testpeer", "@@music/file.mp3", peer.TransferDownload)
+	if !ok {
+		t.Fatal("Transfer should be registered")
+	}
+
+	// Simulate UploadDenied message
+	deniedPayload := encodeUploadDenied("@@music/file.mp3", "access denied")
+	client.handleUploadDenied(deniedPayload, "testpeer")
+
+	// Verify state is Completed|Rejected (not Errored)
+	state := tr.State()
+	if !state.IsCompleted() {
+		t.Error("Transfer should be completed")
+	}
+	if state&TransferStateRejected == 0 {
+		t.Errorf("State = %v, want Rejected flag set", state)
+	}
+	if state&TransferStateErrored != 0 {
+		t.Errorf("State = %v, should NOT have Errored flag", state)
+	}
+
+	// Verify error type
+	tr.mu.RLock()
+	transferErr := tr.Error
+	tr.mu.RUnlock()
+	var rejected *TransferRejectedError
+	if !errors.As(transferErr, &rejected) {
+		t.Errorf("Error type = %T, want *TransferRejectedError", transferErr)
+	}
+}
+
+// TestHandleUploadFailed_SetsErroredState verifies UploadFailed handler
+// sets the correct state and uses TransferFailedError.
+func TestHandleUploadFailed_SetsErroredState(t *testing.T) {
+	client := newTestClient(t)
+	client.loggedIn = true
+	defer func() { _ = client.Disconnect() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	var buf bytes.Buffer
+	_, err := client.Download(ctx, "testpeer", "@@music/file.mp3", &buf)
+	if err != nil {
+		t.Fatalf("Download() error = %v", err)
+	}
+
+	// Get the transfer
+	tr, ok := client.transfers.GetByFile("testpeer", "@@music/file.mp3", peer.TransferDownload)
+	if !ok {
+		t.Fatal("Transfer should be registered")
+	}
+
+	// Simulate UploadFailed message
+	failedPayload := encodeUploadFailed("@@music/file.mp3")
+	client.handleUploadFailed(failedPayload, "testpeer")
+
+	// Verify state is Completed|Errored
+	state := tr.State()
+	if !state.IsCompleted() {
+		t.Error("Transfer should be completed")
+	}
+	if state&TransferStateErrored == 0 {
+		t.Errorf("State = %v, want Errored flag set", state)
+	}
+
+	// Verify error type is TransferFailedError
+	tr.mu.RLock()
+	transferErr := tr.Error
+	tr.mu.RUnlock()
+	var failed *TransferFailedError
+	if !errors.As(transferErr, &failed) {
+		t.Errorf("Error type = %T, want *TransferFailedError", transferErr)
+	}
+	if failed.Username != "testpeer" {
+		t.Errorf("Username = %q, want %q", failed.Username, "testpeer")
+	}
+}
+
+// encodeUploadDenied encodes an UploadDenied message for testing.
+func encodeUploadDenied(filename, reason string) []byte {
+	var buf bytes.Buffer
+	w := protocol.NewWriter(&buf)
+	msg := &peer.UploadDenied{
+		Filename: filename,
+		Reason:   reason,
+	}
+	msg.Encode(w)
+	return buf.Bytes()
+}
+
+// encodeUploadFailed encodes an UploadFailed message for testing.
+func encodeUploadFailed(filename string) []byte {
+	var buf bytes.Buffer
+	w := protocol.NewWriter(&buf)
+	msg := &peer.UploadFailed{
+		Filename: filename,
+	}
+	msg.Encode(w)
+	return buf.Bytes()
+}
+
+// TestDownloadOrchestrator_CheckSizeMismatch tests size mismatch detection.
+func TestDownloadOrchestrator_CheckSizeMismatch(t *testing.T) {
+	tests := []struct {
+		name         string
+		expectedSize int64
+		remoteSize   int64
+		wantErr      bool
+	}{
+		{
+			name:         "no expected size (disabled)",
+			expectedSize: 0,
+			remoteSize:   1000,
+			wantErr:      false,
+		},
+		{
+			name:         "sizes match",
+			expectedSize: 1000,
+			remoteSize:   1000,
+			wantErr:      false,
+		},
+		{
+			name:         "sizes mismatch",
+			expectedSize: 1000,
+			remoteSize:   2000,
+			wantErr:      true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			orch := &downloadOrchestrator{
+				expectedSize: tt.expectedSize,
+			}
+			err := orch.checkSizeMismatch(tt.remoteSize)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("checkSizeMismatch() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if tt.wantErr {
+				var mismatch *TransferSizeMismatchError
+				if !errors.As(err, &mismatch) {
+					t.Errorf("error type = %T, want *TransferSizeMismatchError", err)
+				}
+				if mismatch.LocalSize != tt.expectedSize {
+					t.Errorf("LocalSize = %d, want %d", mismatch.LocalSize, tt.expectedSize)
+				}
+				if mismatch.RemoteSize != tt.remoteSize {
+					t.Errorf("RemoteSize = %d, want %d", mismatch.RemoteSize, tt.remoteSize)
+				}
+			}
+		})
+	}
+}

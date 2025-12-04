@@ -107,10 +107,11 @@ func (c *Client) Download(ctx context.Context, username, filename string, w io.W
 
 	// Create and start orchestrator
 	orch := &downloadOrchestrator{
-		client:   c,
-		transfer: transfer,
-		ctx:      dlCtx,
-		cancel:   cancel,
+		client:       c,
+		transfer:     transfer,
+		expectedSize: cfg.expectedSize,
+		ctx:          dlCtx,
+		cancel:       cancel,
 	}
 	go orch.run()
 
@@ -119,11 +120,12 @@ func (c *Client) Download(ctx context.Context, username, filename string, w io.W
 
 // downloadOrchestrator handles a single download using the new infrastructure.
 type downloadOrchestrator struct {
-	client   *Client
-	transfer *Transfer
-	peerAddr string
-	ctx      context.Context
-	cancel   context.CancelFunc
+	client       *Client
+	transfer     *Transfer
+	peerAddr     string
+	expectedSize int64 // Expected file size (0 = don't check)
+	ctx          context.Context
+	cancel       context.CancelFunc
 }
 
 // run executes the download flow.
@@ -303,6 +305,10 @@ func (o *downloadOrchestrator) waitForTransferResponse(conn *connection.Conn) (*
 // handleTransferResponse processes the peer's response and performs the transfer.
 func (o *downloadOrchestrator) handleTransferResponse(resp *peer.TransferResponse, peerConn *connection.Conn) error {
 	if resp.Allowed {
+		// Check for size mismatch before proceeding
+		if err := o.checkSizeMismatch(resp.FileSize); err != nil {
+			return err
+		}
 		// Immediate transfer
 		o.transfer.mu.Lock()
 		o.transfer.Size = resp.FileSize
@@ -319,6 +325,18 @@ func (o *downloadOrchestrator) handleTransferResponse(resp *peer.TransferRespons
 	o.transfer.emitProgress()
 
 	return o.waitForQueuedTransfer(peerConn)
+}
+
+// checkSizeMismatch verifies the peer's reported file size matches expected.
+// Returns TransferSizeMismatchError if sizes don't match, nil otherwise.
+func (o *downloadOrchestrator) checkSizeMismatch(remoteSize int64) error {
+	if o.expectedSize > 0 && remoteSize != o.expectedSize {
+		return &TransferSizeMismatchError{
+			LocalSize:  o.expectedSize,
+			RemoteSize: remoteSize,
+		}
+	}
+	return nil
 }
 
 // performImmediateTransfer handles immediate transfers where the peer is ready to send.
@@ -451,6 +469,11 @@ func (o *downloadOrchestrator) readPeerMessagesUntilReady(conn *connection.Conn)
 				continue
 			}
 
+			// Check for size mismatch before accepting
+			if err := o.checkSizeMismatch(req.FileSize); err != nil {
+				return err
+			}
+
 			// Store remote token
 			o.transfer.mu.Lock()
 			o.transfer.RemoteToken = req.Token
@@ -507,7 +530,10 @@ func (o *downloadOrchestrator) readPeerMessagesUntilReady(conn *connection.Conn)
 				continue
 			}
 			if failed.Filename == o.transfer.Filename {
-				return errors.New("upload failed")
+				return &TransferFailedError{
+					Username: o.transfer.Username,
+					Filename: failed.Filename,
+				}
 			}
 		}
 	}
@@ -572,7 +598,12 @@ func (o *downloadOrchestrator) transferData(conn *connection.Conn) error {
 			if errors.Is(err, io.EOF) && received == toReceive {
 				break
 			}
-			return fmt.Errorf("read: %w", err)
+			return &ConnectionError{
+				Operation:  "read",
+				BytesSoFar: startOffset + received,
+				TotalBytes: fileSize,
+				Underlying: err,
+			}
 		}
 
 		if _, err := writer.Write(buf[:n]); err != nil {
@@ -600,16 +631,25 @@ func (o *downloadOrchestrator) fail(err error) {
 	case errors.Is(err, context.DeadlineExceeded):
 		state |= TransferStateTimedOut
 	default:
-		var rejected *TransferRejectedError
-		if errors.As(err, &rejected) {
-			state |= TransferStateRejected
-		} else {
-			state |= TransferStateErrored
-		}
+		state |= classifyTransferError(err)
 	}
 
 	o.transfer.SetState(state)
 	o.transfer.emitProgress()
+}
+
+// classifyTransferError determines the appropriate state flag for an error.
+func classifyTransferError(err error) TransferState {
+	var rejected *TransferRejectedError
+	var sizeMismatch *TransferSizeMismatchError
+	switch {
+	case errors.As(err, &rejected):
+		return TransferStateRejected
+	case errors.As(err, &sizeMismatch):
+		return TransferStateAborted
+	default:
+		return TransferStateErrored
+	}
 }
 
 // complete marks the transfer as successfully completed.

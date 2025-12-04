@@ -49,3 +49,30 @@ type TransferSizeMismatchError struct {
 func (e *TransferSizeMismatchError) Error() string {
 	return fmt.Sprintf("size mismatch: local %d, remote %d", e.LocalSize, e.RemoteSize)
 }
+
+// TransferFailedError is returned when the remote peer reports the transfer failed.
+// This is distinct from rejection - the peer accepted the transfer but couldn't complete it.
+type TransferFailedError struct {
+	Username string
+	Filename string
+}
+
+func (e *TransferFailedError) Error() string {
+	return fmt.Sprintf("transfer failed: peer %s reported failure for %s", e.Username, e.Filename)
+}
+
+// ConnectionError wraps connection failures during transfers with additional context.
+type ConnectionError struct {
+	Operation  string // "read" or "write"
+	BytesSoFar int64
+	TotalBytes int64
+	Underlying error
+}
+
+func (e *ConnectionError) Error() string {
+	return fmt.Sprintf("connection %s error at byte %d/%d: %v", e.Operation, e.BytesSoFar, e.TotalBytes, e.Underlying)
+}
+
+func (e *ConnectionError) Unwrap() error {
+	return e.Underlying
+}
