@@ -47,6 +47,9 @@ type Transfer struct {
 	// Error info
 	Error error
 
+	// Queue position for downloads (0 if not queued)
+	queuePosition uint32
+
 	// State machine
 	state     TransferState
 	prevState TransferState
@@ -228,6 +231,22 @@ func (t *Transfer) UpdateProgress(bytesTransferred int64) {
 	t.lastProgressBytes = bytesTransferred
 }
 
+// QueuePosition returns the current position in the remote queue (for downloads).
+// Returns 0 if not queued.
+func (t *Transfer) QueuePosition() uint32 {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.queuePosition
+}
+
+// SetQueuePosition updates the queue position and emits a progress update.
+func (t *Transfer) SetQueuePosition(position uint32) {
+	t.mu.Lock()
+	t.queuePosition = position
+	t.mu.Unlock()
+	t.emitProgress()
+}
+
 // FileKey returns a unique key for this transfer based on direction, username, and filename.
 // Used for duplicate detection.
 func (t *Transfer) FileKey() string {
@@ -253,6 +272,7 @@ func (t *Transfer) emitProgress() {
 		BytesTransferred: t.Transferred,
 		FileSize:         t.Size,
 		AverageSpeed:     t.avgSpeed,
+		QueuePosition:    t.queuePosition,
 		Error:            t.Error,
 	}
 	t.mu.RUnlock()

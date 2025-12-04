@@ -298,3 +298,58 @@ func TestTransfer_TransferReadyCh_Signaling(t *testing.T) {
 		t.Error("Expected to receive TransferReadyInfo")
 	}
 }
+
+func TestTransfer_SetQueuePosition(t *testing.T) {
+	tr := NewTransfer(peer.TransferDownload, "user", "file", 1)
+
+	// Initially should be 0
+	if tr.QueuePosition() != 0 {
+		t.Errorf("initial QueuePosition = %d, want 0", tr.QueuePosition())
+	}
+
+	// Set position
+	tr.SetQueuePosition(5)
+
+	if tr.QueuePosition() != 5 {
+		t.Errorf("QueuePosition = %d, want 5", tr.QueuePosition())
+	}
+}
+
+func TestTransfer_SetQueuePosition_EmitsProgress(t *testing.T) {
+	tr := NewTransfer(peer.TransferDownload, "user", "file", 1)
+	tr.Size = 1000
+
+	progressCh := tr.Progress()
+
+	// Set queue position - should emit progress
+	tr.SetQueuePosition(3)
+
+	// Should receive progress with queue position
+	select {
+	case p := <-progressCh:
+		if p.QueuePosition != 3 {
+			t.Errorf("progress QueuePosition = %d, want 3", p.QueuePosition)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Error("Expected progress update after SetQueuePosition")
+	}
+}
+
+func TestTransfer_Progress_IncludesQueuePosition(t *testing.T) {
+	tr := NewTransfer(peer.TransferDownload, "user", "file", 1)
+	tr.Size = 1000
+	tr.SetQueuePosition(7)
+
+	// Emit progress
+	tr.emitProgress()
+
+	progressCh := tr.Progress()
+	select {
+	case p := <-progressCh:
+		if p.QueuePosition != 7 {
+			t.Errorf("QueuePosition in progress = %d, want 7", p.QueuePosition)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Error("Expected progress update")
+	}
+}

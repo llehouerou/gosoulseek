@@ -13,6 +13,8 @@ import (
 	"github.com/llehouerou/gosoulseek/protocol"
 )
 
+const testUsername = "testUsername"
+
 // TestDownload_RegistersWithTransferRegistry verifies that Download
 // registers the transfer with the TransferRegistry.
 func TestDownload_RegistersWithTransferRegistry(t *testing.T) {
@@ -24,18 +26,18 @@ func TestDownload_RegistersWithTransferRegistry(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 
-	progress, err := client.Download(ctx, "testuser", "@@music/song.mp3", &buf)
+	progress, err := client.Download(ctx, testUsername, "@@music/song.mp3", &buf)
 	if err != nil {
 		t.Fatalf("Download() error = %v", err)
 	}
 
 	// Verify transfer is registered (check immediately, before orchestrator might remove it)
-	tr, ok := client.transfers.GetByFile("testuser", "@@music/song.mp3", peer.TransferDownload)
+	tr, ok := client.transfers.GetByFile(testUsername, "@@music/song.mp3", peer.TransferDownload)
 	if !ok {
 		t.Fatal("Transfer should be registered in TransferRegistry")
 	}
-	if tr.Username != "testuser" {
-		t.Errorf("Username = %q, want %q", tr.Username, "testuser")
+	if tr.Username != testUsername {
+		t.Errorf("Username = %q, want %q", tr.Username, testUsername)
 	}
 	if tr.Filename != "@@music/song.mp3" {
 		t.Errorf("Filename = %q, want %q", tr.Filename, "@@music/song.mp3")
@@ -56,12 +58,12 @@ func TestDownload_WithStartOffset(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 
-	progress, err := client.Download(ctx, "testuser", "@@music/song.mp3", &buf, WithStartOffset(1024))
+	progress, err := client.Download(ctx, "testUsername", "@@music/song.mp3", &buf, WithStartOffset(1024))
 	if err != nil {
 		t.Fatalf("Download() error = %v", err)
 	}
 
-	tr, ok := client.transfers.GetByFile("testuser", "@@music/song.mp3", peer.TransferDownload)
+	tr, ok := client.transfers.GetByFile("testUsername", "@@music/song.mp3", peer.TransferDownload)
 	if !ok {
 		t.Fatal("Transfer should be registered")
 	}
@@ -79,7 +81,7 @@ func TestDownload_NotLoggedIn(t *testing.T) {
 	defer func() { _ = client.Disconnect() }()
 
 	var buf bytes.Buffer
-	_, err := client.Download(context.Background(), "testuser", "@@music/song.mp3", &buf)
+	_, err := client.Download(context.Background(), "testUsername", "@@music/song.mp3", &buf)
 	if err == nil {
 		t.Fatal("Download() should fail when not logged in")
 	}
@@ -95,13 +97,13 @@ func TestDownload_DuplicateTransfer(t *testing.T) {
 	defer cancel()
 
 	var buf1, buf2 bytes.Buffer
-	progress1, err := client.Download(ctx, "testuser", "@@music/song.mp3", &buf1)
+	progress1, err := client.Download(ctx, "testUsername", "@@music/song.mp3", &buf1)
 	if err != nil {
 		t.Fatalf("First Download() error = %v", err)
 	}
 
 	// Second download for same file should fail
-	_, err = client.Download(ctx, "testuser", "@@music/song.mp3", &buf2)
+	_, err = client.Download(ctx, "testUsername", "@@music/song.mp3", &buf2)
 	if err == nil {
 		t.Fatal("Download() should fail for duplicate transfer")
 	}
@@ -124,12 +126,12 @@ func TestDownload_InitializesTransferChannels(t *testing.T) {
 	defer cancel()
 
 	var buf bytes.Buffer
-	progress, err := client.Download(ctx, "testuser", "@@music/song.mp3", &buf)
+	progress, err := client.Download(ctx, "testUsername", "@@music/song.mp3", &buf)
 	if err != nil {
 		t.Fatalf("Download() error = %v", err)
 	}
 
-	tr, ok := client.transfers.GetByFile("testuser", "@@music/song.mp3", peer.TransferDownload)
+	tr, ok := client.transfers.GetByFile("testUsername", "@@music/song.mp3", peer.TransferDownload)
 	if !ok {
 		t.Fatal("Transfer should be registered")
 	}
@@ -155,7 +157,7 @@ func TestDownload_ReturnsProgressChannel(t *testing.T) {
 	defer cancel()
 
 	var buf bytes.Buffer
-	progress, err := client.Download(ctx, "testuser", "@@music/song.mp3", &buf)
+	progress, err := client.Download(ctx, "testUsername", "@@music/song.mp3", &buf)
 	if err != nil {
 		t.Fatalf("Download() error = %v", err)
 	}
@@ -212,7 +214,7 @@ func TestDownloadOrchestrator_StateTransitions(t *testing.T) {
 	defer cancel()
 
 	var buf bytes.Buffer
-	progress, err := client.Download(ctx, "testuser", "@@music/song.mp3", &buf)
+	progress, err := client.Download(ctx, "testUsername", "@@music/song.mp3", &buf)
 	if err != nil {
 		t.Fatalf("Download() error = %v", err)
 	}
@@ -358,4 +360,241 @@ func TestDeliverTransferConnection_NoMatchingTransfer(t *testing.T) {
 	// This should not panic and just log a message
 	client.deliverTransferConnection("unknownpeer", 99999, mockConn)
 	// Test passes if no panic occurs
+}
+
+// TestGetDownloadPlaceInQueue_NotLoggedIn verifies error when not logged in.
+func TestGetDownloadPlaceInQueue_NotLoggedIn(t *testing.T) {
+	client := newTestClient(t)
+	defer func() { _ = client.Disconnect() }()
+
+	_, err := client.GetDownloadPlaceInQueue(context.Background(), "testUsername", "@@music/song.mp3")
+	if err == nil {
+		t.Fatal("GetDownloadPlaceInQueue() should fail when not logged in")
+	}
+}
+
+// TestGetDownloadPlaceInQueue_NoSuchDownload verifies error when no download exists.
+func TestGetDownloadPlaceInQueue_NoSuchDownload(t *testing.T) {
+	client := newTestClient(t)
+	client.loggedIn = true
+	defer func() { _ = client.Disconnect() }()
+
+	_, err := client.GetDownloadPlaceInQueue(context.Background(), "testUsername", "@@music/song.mp3")
+	if err == nil {
+		t.Fatal("GetDownloadPlaceInQueue() should fail when no download exists")
+	}
+}
+
+// TestGetDownloadPlaceInQueue_UpdatesTransferQueuePosition tests that receiving
+// PlaceInQueueResponse updates the transfer's queue position.
+func TestGetDownloadPlaceInQueue_UpdatesTransferQueuePosition(t *testing.T) {
+	client := newTestClient(t)
+	client.loggedIn = true
+	defer func() { _ = client.Disconnect() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	var buf bytes.Buffer
+	_, err := client.Download(ctx, "testpeer", "@@music/file.mp3", &buf)
+	if err != nil {
+		t.Fatalf("Download() error = %v", err)
+	}
+
+	// Get the transfer
+	tr, ok := client.transfers.GetByFile("testpeer", "@@music/file.mp3", peer.TransferDownload)
+	if !ok {
+		t.Fatal("Transfer should be registered")
+	}
+
+	// Simulate receiving PlaceInQueueResponse
+	responsePayload := encodePlaceInQueueResponse("@@music/file.mp3", 5)
+	client.handlePlaceInQueueResponse(responsePayload, "testpeer")
+
+	// Verify queue position was updated
+	if tr.QueuePosition() != 5 {
+		t.Errorf("QueuePosition = %d, want 5", tr.QueuePosition())
+	}
+}
+
+// encodePlaceInQueueResponse encodes a PlaceInQueueResponse for testing.
+func encodePlaceInQueueResponse(filename string, place uint32) []byte {
+	var buf bytes.Buffer
+	w := protocol.NewWriter(&buf)
+	resp := &peer.PlaceInQueueResponse{
+		Filename: filename,
+		Place:    place,
+	}
+	resp.Encode(w)
+	return buf.Bytes()
+}
+
+// encodePlaceInQueueRequest encodes a PlaceInQueueRequest for testing.
+func encodePlaceInQueueRequest(filename string) []byte {
+	var buf bytes.Buffer
+	w := protocol.NewWriter(&buf)
+	req := &peer.PlaceInQueueRequest{
+		Filename: filename,
+	}
+	req.Encode(w)
+	return buf.Bytes()
+}
+
+// TestHandlePlaceInQueueRequest_SendsResponse tests that receiving a PlaceInQueueRequest
+// results in a PlaceInQueueResponse being sent.
+func TestHandlePlaceInQueueRequest_SendsResponse(t *testing.T) {
+	client := newTestClientWithQueueManager(t)
+	client.loggedIn = true
+	defer func() { _ = client.Disconnect() }()
+
+	// Enqueue an upload in the queue manager
+	client.queueMgr.EnqueueUpload("requester", "@@music/file.mp3", 100)
+
+	// Create a mock peer connection to capture the response
+	peerServer, peerClient := net.Pipe()
+	t.Cleanup(func() {
+		peerServer.Close()
+		peerClient.Close()
+	})
+	mockConn := connection.NewConn(peerClient)
+
+	// Simulate receiving PlaceInQueueRequest
+	requestPayload := encodePlaceInQueueRequest("@@music/file.mp3")
+
+	// Start goroutine to read the response
+	responseCh := make(chan *peer.PlaceInQueueResponse, 1)
+	go func() {
+		// Read the response from peerServer
+		lenBuf := make([]byte, 4)
+		_, err := peerServer.Read(lenBuf)
+		if err != nil {
+			return
+		}
+		msgLen := int(lenBuf[0]) | int(lenBuf[1])<<8 | int(lenBuf[2])<<16 | int(lenBuf[3])<<24
+		payload := make([]byte, msgLen)
+		_, err = peerServer.Read(payload)
+		if err != nil {
+			return
+		}
+		resp, err := peer.DecodePlaceInQueueResponse(payload)
+		if err != nil {
+			return
+		}
+		responseCh <- resp
+	}()
+
+	// Call the handler
+	client.handlePlaceInQueueRequest(requestPayload, "requester", mockConn)
+
+	// Verify response was sent
+	select {
+	case resp := <-responseCh:
+		if resp.Filename != "@@music/file.mp3" {
+			t.Errorf("Filename = %q, want %q", resp.Filename, "@@music/file.mp3")
+		}
+		if resp.Place != 1 {
+			t.Errorf("Place = %d, want 1", resp.Place)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Error("Expected PlaceInQueueResponse to be sent")
+	}
+}
+
+// TestHandlePlaceInQueueRequest_FileNotInQueue tests that no response is sent
+// when the file is not in our queue.
+func TestHandlePlaceInQueueRequest_FileNotInQueue(t *testing.T) {
+	client := newTestClientWithQueueManager(t)
+	client.loggedIn = true
+	defer func() { _ = client.Disconnect() }()
+
+	// Create a mock peer connection
+	peerServer, peerClient := net.Pipe()
+	t.Cleanup(func() {
+		peerServer.Close()
+		peerClient.Close()
+	})
+	mockConn := connection.NewConn(peerClient)
+
+	// Set a short deadline for the pipe read
+	_ = peerServer.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+
+	// Simulate receiving PlaceInQueueRequest for unknown file
+	requestPayload := encodePlaceInQueueRequest("@@music/unknown.mp3")
+
+	// Call the handler
+	client.handlePlaceInQueueRequest(requestPayload, "requester", mockConn)
+
+	// Verify NO response was sent (read should timeout)
+	buf := make([]byte, 4)
+	_, err := peerServer.Read(buf)
+	if err == nil {
+		t.Error("Should not receive response for file not in queue")
+	}
+}
+
+// TestHandlePlaceInQueueRequest_CustomResolver tests that a custom resolver
+// can override the queue position.
+func TestHandlePlaceInQueueRequest_CustomResolver(t *testing.T) {
+	client := newTestClientWithQueueManager(t)
+	client.loggedIn = true
+	defer func() { _ = client.Disconnect() }()
+
+	// Set custom resolver that always returns position 42
+	client.queueMgr.SetResolver(func(_, _ string) (uint32, error) {
+		return 42, nil
+	})
+
+	// Enqueue an upload (position would be 1 without custom resolver)
+	client.queueMgr.EnqueueUpload("requester", "@@music/file.mp3", 100)
+
+	// Create a mock peer connection
+	peerServer, peerClient := net.Pipe()
+	t.Cleanup(func() {
+		peerServer.Close()
+		peerClient.Close()
+	})
+	mockConn := connection.NewConn(peerClient)
+
+	// Start goroutine to read the response
+	responseCh := make(chan *peer.PlaceInQueueResponse, 1)
+	go func() {
+		lenBuf := make([]byte, 4)
+		_, err := peerServer.Read(lenBuf)
+		if err != nil {
+			return
+		}
+		msgLen := int(lenBuf[0]) | int(lenBuf[1])<<8 | int(lenBuf[2])<<16 | int(lenBuf[3])<<24
+		payload := make([]byte, msgLen)
+		_, err = peerServer.Read(payload)
+		if err != nil {
+			return
+		}
+		resp, err := peer.DecodePlaceInQueueResponse(payload)
+		if err != nil {
+			return
+		}
+		responseCh <- resp
+	}()
+
+	// Call the handler
+	requestPayload := encodePlaceInQueueRequest("@@music/file.mp3")
+	client.handlePlaceInQueueRequest(requestPayload, "requester", mockConn)
+
+	// Verify response has custom position
+	select {
+	case resp := <-responseCh:
+		if resp.Place != 42 {
+			t.Errorf("Place = %d, want 42 (from custom resolver)", resp.Place)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Error("Expected PlaceInQueueResponse to be sent")
+	}
+}
+
+// newTestClientWithQueueManager creates a test client with a QueueManager.
+func newTestClientWithQueueManager(t *testing.T) *Client {
+	t.Helper()
+	client := newTestClient(t)
+	client.queueMgr = NewQueueManager()
+	return client
 }

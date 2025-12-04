@@ -23,6 +23,7 @@ type Client struct {
 	router          *MessageRouter
 	searches        *searchRegistry
 	transfers       *TransferRegistry // Unified transfer tracking
+	queueMgr        *QueueManager     // Manages upload queue positions
 	listener        *Listener
 	peerConnMgr     *peerConnManager           // Manages P-type connections to peers
 	transferConnMgr *TransferConnectionManager // Manages F-type transfer connections
@@ -58,6 +59,7 @@ func New(opts *Options) *Client {
 		router:        NewMessageRouter(),
 		searches:      newSearchRegistry(),
 		transfers:     NewTransferRegistry(),
+		queueMgr:      NewQueueManager(),
 		solicitations: newPendingSolicitations(),
 		peerSolicits:  newPendingPeerSolicits(),
 	}
@@ -554,7 +556,7 @@ func (c *Client) handlePlaceInQueueResponse(payload []byte, username string) {
 
 	tr, ok := c.transfers.GetByFile(username, resp.Filename, peer.TransferDownload)
 	if ok {
-		tr.emitProgress()
+		tr.SetQueuePosition(resp.Place)
 	}
 }
 
@@ -590,4 +592,33 @@ func (c *Client) handleUploadFailed(payload []byte, username string) {
 		tr.SetState(TransferStateCompleted | TransferStateErrored)
 		tr.emitProgress()
 	}
+}
+
+// handlePlaceInQueueRequest handles PlaceInQueueRequest messages from peers.
+// When a peer asks for their queue position, we respond with PlaceInQueueResponse.
+func (c *Client) handlePlaceInQueueRequest(payload []byte, username string, conn *connection.Conn) {
+	req, err := peer.DecodePlaceInQueueRequest(payload)
+	if err != nil {
+		return
+	}
+
+	// Resolve the queue position
+	position, err := c.queueMgr.ResolvePosition(username, req.Filename)
+	if err != nil || position == 0 {
+		// Don't respond if file is not in queue or resolver returned error
+		return
+	}
+
+	// Send PlaceInQueueResponse
+	var buf bytes.Buffer
+	w := protocol.NewWriter(&buf)
+	resp := &peer.PlaceInQueueResponse{
+		Filename: req.Filename,
+		Place:    position,
+	}
+	resp.Encode(w)
+	if err := w.Error(); err != nil {
+		return
+	}
+	_ = conn.WriteMessage(buf.Bytes())
 }

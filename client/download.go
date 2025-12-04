@@ -652,6 +652,28 @@ func (c *Client) deliverTransferConnection(username string, remoteToken uint32, 
 	}
 }
 
+// GetDownloadPlaceInQueue returns the current queue position for a pending download.
+// Returns an error if not logged in or if no download exists for the given file.
+// Note: This method returns the last known queue position; to poll for updates,
+// use the transfer's Progress() channel which emits updates when PlaceInQueueResponse
+// messages are received.
+func (c *Client) GetDownloadPlaceInQueue(_ context.Context, username, filename string) (uint32, error) {
+	c.mu.Lock()
+	if !c.loggedIn {
+		c.mu.Unlock()
+		return 0, errors.New("not logged in")
+	}
+	c.mu.Unlock()
+
+	// Look up the download
+	tr, ok := c.transfers.GetByFile(username, filename, peer.TransferDownload)
+	if !ok {
+		return 0, fmt.Errorf("no download for %s from %s", filename, username)
+	}
+
+	return tr.QueuePosition(), nil
+}
+
 // handleTransferRequest handles TransferRequest messages from peers.
 // When direction is Upload, it signals the corresponding download transfer
 // and sends a TransferResponse to acknowledge we're ready to receive.
